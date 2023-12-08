@@ -1,0 +1,3 @@
+[submodule "tenet"]
+	path = tenet
+	url = https://github.com/hexa-synacktiv/tenet
