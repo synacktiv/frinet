@@ -112,7 +112,7 @@ function trace(args) {
                         else Stalker.follow(this.threadId, {transform: cmod.transform});
                 },
                 onLeave: function(retval) {
-                        if(!this.inside || args.end_addr)return
+                        if(!this.inside || (args.end_addr != undefined))return
                         console.log(`Leaving function`);
                         Stalker.unfollow(this.threadId);
                         Stalker.flush();

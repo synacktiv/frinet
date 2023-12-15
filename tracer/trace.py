@@ -28,7 +28,10 @@ def file_read(path: str) -> str:
 
 def file_append(path: str, data: str):
     root_dir = os.path.dirname(os.path.realpath(__file__))
-    with open(os.path.join(root_dir, path), 'a') as fd:
+    filepath = os.path.join(root_dir, path)
+    if not os.path.isfile(filepath):
+        logging.info("Creating trace file "+filepath)
+    with open(filepath, 'a') as fd:
         return fd.write(data)
 
 
@@ -212,6 +215,7 @@ def do_trace(args, attach):
         except KeyboardInterrupt:
             logging.info('Interrupting...')
 
+        print("")
         script.exports_sync.end()
         script.unload()
         sess.detach()
