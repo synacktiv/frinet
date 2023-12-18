@@ -1,8 +1,7 @@
 # Frinet
 
 Multi-platform trace generation with Frida, combined with a modified version of the Tenet plugin for exploration.
-
-*TODO_BLOGPOST_URL*
+[Blogpost on the Synactiv website](https://www.synacktiv.com/publications/frinet-reverse-engineering-made-easier)
 
 **General use case** : Tracing the execution of a specific function in a userland process, on a Frida-compatible system (Tested on Linux/Android/iOS/Windows).
 
@@ -98,8 +97,8 @@ IDA Pro (tested on ```Version 8.3.230608 Linux x86_64``` but should work in most
 ### How to use
 
 ```
-cp tenet/tenet_plugin.py ~/.idapro/plugins
-cp -R tenet/tenet ~/.idapro/plugins
+cp tenet/plugins/tenet_plugin.py ~/.idapro/plugins
+cp -R tenet/plugins/tenet ~/.idapro/plugins
 ```
 
 Then, in IDA after loading the correct binary :
