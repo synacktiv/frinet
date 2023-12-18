@@ -114,7 +114,8 @@ Then, in IDA after loading the correct binary :
 File -> Load file -> Tenet trace file
 ```
 
-For more information, see the original author's blogpost about the tool :
+For more information, see the *README.md* from our Tenet fork, as well as the original author's blogpost about the tool :
+ * https://github.com/hexa-synacktiv/tenet/blob/master/README.md
  * http://blog.ret2.io/2021/04/20/tenet-trace-explorer/
 
 ### New features
