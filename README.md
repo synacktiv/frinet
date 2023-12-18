@@ -40,6 +40,8 @@ Partially supported architectures (slower and less precise memory tracking, but 
 
 Python3 and Frida
 
+```pip install frida```
+
 ### How to use
 
 ```
