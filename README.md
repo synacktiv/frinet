@@ -16,11 +16,15 @@ README, we did not do a pull request (yet) because our new features break some o
 Our custom version is required for use with this tracer, but can still process traces from other 
 Tenet tracers.
 
+ This repository needs to be cloned using the recursive flag : 
+
+```git clone --recursive https://github.com/synacktiv/frinet.git```
+
 ## Tracer
 
 ### Features
 
-Compatible with **Linux**, **Android** & **iOS**
+Compatible with **Windows**, **Linux**, **Android** & **iOS**
 
 Fully supported architecture :
 
