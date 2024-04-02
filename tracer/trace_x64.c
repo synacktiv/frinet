@@ -572,6 +572,9 @@ transform(GumStalkerIterator *iterator, GumStalkerOutput *output,
                                 if (op->mem.segment != X86_REG_INVALID)
                                         break;
                                 ctx_insn->mems[ctx_insn->n_mems].op = op->mem;
+                                if (op->mem.base == X86_REG_RIP || op->mem.base == X86_REG_EIP) {
+                                        ctx_insn->mems[ctx_insn->n_mems].op.disp += insn->size;
+                                }
                                 ctx_insn->mems[ctx_insn->n_mems].ac = op->access;
                                 ctx_insn->mems[ctx_insn->n_mems].size = op->size;
                                 ctx_insn->mems[ctx_insn->n_mems].stackreg = 0;
