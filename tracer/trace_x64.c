@@ -1,6 +1,7 @@
 #include <capstone.h>
 #include <glib.h>
 #include <gum/gumstalker.h>
+#include <gum/gumprocess.h>
 #include <string.h>
 
 
@@ -335,6 +336,7 @@ static inline void print_trace_line_cmp(GumCpuContext *cpu_ctx, x86_reg reg)
 static void
 on_insn(GumCpuContext *cpu_ctx, gpointer user_data)
 {
+        gint saved_system_error = gum_thread_get_system_error();
         const struct ctx_insn *ctx_insn = user_data;
         struct ctx_trace *last_ctx_trace = &state->last_ctx_trace;
         struct ctx_insn *last_ctx_insn = &last_ctx_trace->ctx_insn;
@@ -469,6 +471,7 @@ on_insn(GumCpuContext *cpu_ctx, gpointer user_data)
                 }
         #endif
 
+        gum_thread_set_system_error(saved_system_error);
 }
 
 
@@ -493,17 +496,20 @@ finalize(void)
 void
 flush(void)
 {
+        gint saved_system_error = gum_thread_get_system_error();
         gchar *trace = g_string_free(state->trace, FALSE);
 
         send(trace);
         g_free(trace);
         state->trace = g_string_new(NULL);
+        gum_thread_set_system_error(saved_system_error);
 }
 
 void
 transform(GumStalkerIterator *iterator, GumStalkerOutput *output,
           gpointer user_data)
 {
+        gint saved_system_error = gum_thread_get_system_error();
         cs_insn *insn;
         gsize insn_cnt = 0;
         gboolean enable_regs;
@@ -595,5 +601,6 @@ transform(GumStalkerIterator *iterator, GumStalkerOutput *output,
                 gum_stalker_iterator_keep(iterator);
                 ++insn_cnt;
         }
+	gum_thread_set_system_error(saved_system_error);
 }
 
