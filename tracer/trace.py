@@ -192,6 +192,7 @@ def do_trace(args, attach):
         logging.info('Tracing...')
         errcode = script.exports_sync.trace({
             'module': args.module,
+            'traced_module' : args.traced_module if args.traced_module else args.module,
             'addr': addr,
             'once': not args.multirun,
             'exclude' : args.exclude,
@@ -307,6 +308,12 @@ def main():
         help='Address of instruction that will force a trace flush (useful when investigating a crash)'
     )
 
+    parser.add_argument(
+        '-t', '--traced-module',
+        type=str,
+        help='Module name to trace (equal to module argument by default)'
+    )
+
     sp = parser.add_subparsers()
     sp_spawn = sp.add_parser('spawn', help='Spawn process')
     sp_attach = sp.add_parser('attach', help='Attach to process')
@@ -320,7 +327,7 @@ def main():
     parser.add_argument(
         'module',
         type=str,
-        help='module name to instrument'
+        help='module name to place the hook'
     )
 
     parser.add_argument(
