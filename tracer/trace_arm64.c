@@ -39,12 +39,14 @@ struct state {
         guint32 mflag;
         char dump_all_regs;
         bool exclude;
+        bool needmem;
 };
 
 
 extern struct state *state;
 extern int filter(guintptr addr);
 extern bool exclude();
+extern bool needmem();
 extern char swap_rw();
 extern void send(gchar *str);
 
@@ -613,6 +615,7 @@ init(void)
         state->trace = g_string_new(NULL);
         state->dump_all_regs = 2;
         state->exclude = exclude();
+        state->needmem = needmem();
         if(swap_rw())state->mflag = CS_AC_READ;
         else state->mflag = CS_AC_WRITE;
 }
@@ -641,7 +644,9 @@ transform(GumStalkerIterator *iterator, GumStalkerOutput *output,
         cs_insn *insn;
         gsize insn_cnt = 0;
         gboolean enable_regs;
+        gboolean enable_mem;
         enable_regs = true;
+        enable_mem = state->needmem;
         while (gum_stalker_iterator_next(iterator, &insn)) {
                 cs_arm64 *insn_arm64;
                 struct ctx_insn *ctx_insn;
@@ -650,7 +655,7 @@ transform(GumStalkerIterator *iterator, GumStalkerOutput *output,
                 if (insn_cnt == 0)
                 {
                         if (filter(insn->address)) {
-                                if(exclude())
+                                if(state->exclude)
                                 {
                                         gum_stalker_iterator_keep(iterator);
                                         continue;
@@ -678,6 +683,8 @@ transform(GumStalkerIterator *iterator, GumStalkerOutput *output,
                                         ctx_insn->regs[ctx_insn->n_regs++] = op->reg;
                                 break;
                         case ARM64_OP_MEM:
+                                if(!enable_mem)break;
+
                                 ctx_insn->mems[ctx_insn->n_mems].op = op->mem;
                                 ctx_insn->mems[ctx_insn->n_mems].ac = op->access;
                                 ctx_insn->mems[ctx_insn->n_mems].size = mem_size(insn, &(insn_arm64->operands[0]));

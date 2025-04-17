@@ -39,12 +39,14 @@ struct state {
         GumCpuContext *old_cpu_ctx;
         char dump_all_regs;
         bool exclude;
+        bool needmem;
 };
 
 
 extern struct state *state;
 extern int filter(guintptr addr);
 extern bool exclude();
+extern bool needmem();
 extern char swap_rw();
 extern void send(gchar *str);
 
@@ -481,6 +483,7 @@ init(void)
         state->trace = g_string_new(NULL);
         state->dump_all_regs = 2;
         state->exclude = exclude();
+        state->needmem = needmem();
 }
 
 void
@@ -507,7 +510,9 @@ transform(GumStalkerIterator *iterator, GumStalkerOutput *output,
         cs_insn *insn;
         gsize insn_cnt = 0;
         gboolean enable_regs;
+        gboolean enable_mem;
         enable_regs = true;
+        enable_mem = state->needmem;
         while (gum_stalker_iterator_next(iterator, &insn)) {
                 cs_x86 *insn_x86;
                 struct ctx_insn *ctx_insn;
@@ -516,7 +521,7 @@ transform(GumStalkerIterator *iterator, GumStalkerOutput *output,
                 if (insn_cnt == 0)
                 {
                         if (filter(insn->address)) {
-                                if(exclude())
+                                if(state->exclude)
                                 {
                                         gum_stalker_iterator_keep(iterator);
                                         continue;
@@ -562,6 +567,8 @@ transform(GumStalkerIterator *iterator, GumStalkerOutput *output,
                                         ctx_insn->regs[ctx_insn->n_regs++] = op->reg;
                                 break;
                         case X86_OP_MEM:
+                                if(!enable_mem)break;
+                                
                                 /* TODO: lea */
                                 if (insn->id == X86_INS_LEA)
                                         break;
@@ -579,6 +586,7 @@ transform(GumStalkerIterator *iterator, GumStalkerOutput *output,
                                 ctx_insn->mems[ctx_insn->n_mems].size = op->size;
                                 ctx_insn->mems[ctx_insn->n_mems].stackreg = 0;
                                 ++ctx_insn->n_mems;
+                                
                                 break;
                         default:
                                 break;

@@ -161,12 +161,15 @@ def do_trace(args, attach):
             return 1
 
         elif arch!="arm64" and arch!='x64' and not args.slow:
-            logging.warning(f'Process architecture {arch} is only supported in slow mode.\n Slow mode has been acivated.')
+            logging.warning(f'Process architecture {arch} is only supported in slow mode.\n Slow mode has been activated.')
             args.slow = True
         
         if args.slow and not args.exclude:
             logging.warning("The exclude option was activated because it is required for slow mode")
             args.exclude = True
+
+        if args.slow and args.nomem:
+            logging.warning(f'nomem is incompatible with slow mode, it will have no effect')
 
         logging.info('Loading C module...')
         if arch == 'x64':
@@ -196,6 +199,7 @@ def do_trace(args, attach):
             'addr': addr,
             'once': not args.multirun,
             'exclude' : args.exclude,
+            'needmem' : not args.nomem,
             'swap_rw' : 1 if (arch == "arm64" and sysenv['os']['name']=="Android") else 0,
             'slow' : args.slow,
             'end_addr' : int(args.end,16) if args.end else None,
@@ -288,6 +292,12 @@ def main():
         '-e', '--exclude',
         action='store_true',
         help='exclude all other modules (memory tracing will be inaccurate)'
+    )
+
+    parser.add_argument(
+        '-n', '--nomem',
+        action='store_true',
+        help='disable memory tracking, makes tracing a bit faster and can fix some issues'
     )
 
     parser.add_argument(

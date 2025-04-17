@@ -23,6 +23,7 @@ function trace(args) {
         var addr = ptr(args["addr"]);
         var once = args["once"];
         var exclude = args["exclude"];
+        var needmem = args["needmem"];
 
         var traced_base = -1;
         var traced_end = -1;
@@ -93,6 +94,9 @@ function trace(args) {
                                 }, 'int', ['size_t']),
                                 'exclude': new NativeCallback(() => {
                                         return exclude ? 1 : 0;
+                                }, 'bool', []),
+                                'needmem': new NativeCallback(() => {
+                                        return needmem ? 1 : 0;
                                 }, 'bool', []),
                                 'swap_rw': new NativeCallback(() => {
                                         return args["swap_rw"];
