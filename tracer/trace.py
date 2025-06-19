@@ -9,6 +9,7 @@ import time
 import pathlib
 import frida
 from slow.trace_slow import do_slowmode_output
+from utils import print_lib_usage
 
 wd = os.path.dirname(os.path.abspath(__file__))
 MODULE_JS_PATH = os.path.join(wd,'trace.js')
@@ -26,11 +27,20 @@ def file_read(path: str) -> str:
         return fd.read()
 
 
-def file_append(path: str, data: str):
+last_modules = None
+last_trace = None
+def file_append(path: str, data: str, is_modules: bool):
+    global last_modules, last_trace
     root_dir = os.path.dirname(os.path.realpath(__file__))
     filepath = os.path.join(root_dir, path)
     if not os.path.isfile(filepath):
-        logging.info("Creating trace file "+filepath)
+        logging.info("Creating file "+filepath)
+
+    if is_modules:
+        last_modules = filepath
+    else:
+        last_trace = filepath
+
     with open(filepath, 'a') as fd:
         return fd.write(data)
 
@@ -42,7 +52,7 @@ def do_attach(args):
     do_trace(args, True)
 
 def do_trace(args, attach):
-    global arch
+    global arch, slide
     devmgr = frida.get_device_manager()
 
     if args.device:
@@ -114,7 +124,7 @@ def do_trace(args, attach):
 
             if msg['type'] == 'error':
                 # TODO: handle errors
-                raise Exception(f'Script error: `{msg}`')
+                raise Exception(f'Script error: `{msg["description"]}`')
             elif msg['type'] == 'send':
                 payload = msg['payload']
 
@@ -150,8 +160,14 @@ def do_trace(args, attach):
                         seen_tids.add(tid)
                     midline_break[tid] = data[-1]!="\n"
                     logging.info(f'Writing trace data of {len(data)} bytes...')
-                    file_append(path, data)
+                    file_append(path, data, False)
                     return
+                elif payload['id'] == 'module':
+                    path = f'{TRACES_DIR}/'+re.sub("[^a-zA-Z_0-9.]","",f'{procname}_{epoch}.modules')
+                    data = payload["name"] + " " + payload['start'] + " " + payload['end'] + "\n"
+                    file_append(path, data, True)
+
+
         script.on('message', on_message)
         script.load()
 
@@ -185,7 +201,6 @@ def do_trace(args, attach):
             c_src = file_read(c_path)
             script.exports_sync.send_src({'src': c_src, 'is_c':True})
         
-
         try:
             addr = int(args.addr, 0)
         except ValueError:
@@ -220,7 +235,9 @@ def do_trace(args, attach):
         except KeyboardInterrupt:
             logging.info('Interrupting...')
 
-        print("")
+        if args.traced_module == "*" and last_modules and last_trace: 
+            print_lib_usage(last_trace, last_modules)
+
         script.exports_sync.end()
         script.unload()
         sess.detach()
@@ -321,7 +338,7 @@ def main():
     parser.add_argument(
         '-t', '--traced-module',
         type=str,
-        help='Module name to trace (equal to module argument by default)'
+        help="Module name to trace PC from, equal to module argument by default, '*' for ALL modules. '*' will also create a file containing the module map, and summarize which libs were present in the trace"
     )
 
     sp = parser.add_subparsers()

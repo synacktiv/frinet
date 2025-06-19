@@ -128,26 +128,38 @@ class Slowmode
         }
         if(writeval)
         {
-            this.lastwrite={}
-            let siz = 8
-            
-            let ptr = (new NativePointer(this.realcontext(context, writeval[0].base))).add(writeval[0].disp)
-            if(writeval[0].index)ptr = ptr.add(new NativePointer(this.realcontext(context, writeval[0].index)))
-            this.lastwrite.ptr = ptr
-            this.lastwrite.siz = siz
+            try{
+                this.lastwrite={}
+                let siz = 8
+                
+                let ptr = (new NativePointer(this.realcontext(context, writeval[0].base))).add(writeval[0].disp)
+                if(writeval[0].index)ptr = ptr.add(new NativePointer(this.realcontext(context, writeval[0].index)))
+                this.lastwrite.ptr = ptr
+                this.lastwrite.siz = siz
+            }
+            catch(e)
+            {
+                send("minor error : mw failed !")
+            }
         }
     
         if(readval)
         {
-            let siz = 8
-            let ptr = (new NativePointer(this.realcontext(context, readval[0].base))).add(readval[0].disp)
-            if(readval[0].index)
-            {
-                let dst = this.realcontext(context, readval[0].index)
-                
-                ptr = ptr.add(new NativePointer(dst))
+            try{
+                let siz = 8
+                let ptr = (new NativePointer(this.realcontext(context, readval[0].base))).add(readval[0].disp)
+                if(readval[0].index)
+                {
+                    let dst = this.realcontext(context, readval[0].index)
+                    
+                    ptr = ptr.add(new NativePointer(dst))
+                }
+                contx.mr = ptr+":"+this.buf2hex(ptr.readByteArray(siz))
             }
-            contx.mr = ptr+":"+this.buf2hex(ptr.readByteArray(siz))
+            catch(e)
+            {
+                send("minor error : mr failed !")
+            }
         }
     
         this.allctx.push(contx)

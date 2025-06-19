@@ -20,18 +20,23 @@ function removeItemOnce(arr, value) {
 function trace(args) {
         var module = args["module"];
         var traced_module = args["traced_module"];
+
         var addr = ptr(args["addr"]);
         var once = args["once"];
         var exclude = args["exclude"];
         var needmem = args["needmem"];
 
-        var traced_base = -1;
-        var traced_end = -1;
+        var traced_base = traced_module == '*'? 0: -1;
+        var traced_end = traced_module == '*'? Infinity: -1;
         var base = -1;
         var modules = Process.enumerateModules();
         modules.forEach(mod => {
-                
-                if ((mod.name !== traced_module)) {
+
+                if(traced_module == '*')
+                {
+                        send({id: "module", name: mod.name,start: mod.base, end: mod.base.add(mod.size)});
+                }
+                else if (mod.name !== traced_module) {
                         if(exclude)
                         {
                                 console.log(`Excluding '${mod.name}'.`);
@@ -60,9 +65,8 @@ function trace(args) {
                 return 1;
         }
 
-        send({id: "slide", slide: traced_base});
+        if(traced_module != '*')send({id: "slide", slide: traced_base});
         
-        var hook;
         var slow = args.slow
         var cmods = []
         var getstalker = (mytid) => {
@@ -87,11 +91,19 @@ function trace(args) {
                                 c_src = "#define TRACE_ADDR "+(traced_base.add(args.trace_addr))+"LL\n"+c_src
                         }
 
+                        let filter_func
+                        if(traced_module == '*')
+                                filter_func = new NativeCallback(addr => {
+                                        return 0;
+                                }, 'int', ['size_t'])
+                        else
+                                filter_func = new NativeCallback(addr => {
+                                        return ((addr >= traced_base) && (addr < traced_end)) ? 0 : 1;
+                                }, 'int', ['size_t'])
+
                         let cmod = new CModule(c_src, {
                                 'state': Memory.alloc(Process.pointerSize),
-                                'filter': new NativeCallback(addr => {
-                                        return ((addr >= traced_base) && (addr < traced_end)) ? 0 : 1;
-                                }, 'int', ['size_t']),
+                                'filter': filter_func,
                                 'exclude': new NativeCallback(() => {
                                         return exclude ? 1 : 0;
                                 }, 'bool', []),
@@ -131,32 +143,37 @@ function trace(args) {
                         flush()
         })
 
-        hook = Interceptor.attach(base.add(addr), {
-                onEnter: function(args) {
-                        this.inside = false
-                        if(threadIds.includes(Process.getCurrentThreadId()))return
-                        this.inside = true
-                        console.log(`Entering function`);
-                        threadIds.push(Process.getCurrentThreadId())
-                        let stalk = getstalker(Process.getCurrentThreadId())
-                        this.flush = stalk[0]
-                        flushs.push(this.flush)
-                        Stalker.follow(Process.getCurrentThreadId(), {transform: stalk[1]});
+        var hook
+        var filter_tid = -1
+        var onEnter = function(args) {
+                this.inside = false
+                let curpid = Process.getCurrentThreadId()
+                if(threadIds.includes(curpid) || (filter_tid>=0 && filter_tid != curpid))return
+                this.inside = true
+                console.log(`Entering function`);
+                threadIds.push(curpid)
+                let stalk = getstalker(curpid)
+                this.flush = stalk[0]
+                flushs.push(this.flush)
+                Stalker.follow(curpid, {transform: stalk[1]});
+        }
+        var onLeave = function(retval) {
+                if(!this.inside || (args.end_addr != undefined))return
+                removeItemOnce(threadIds, Process.getCurrentThreadId())
+                console.log(`Leaving function`);
+                removeItemOnce(flushs, this.flush)
+                Stalker.unfollow(Process.getCurrentThreadId());
+                Stalker.flush();
+                this.flush()
+                if (once) {
+                        Stalker.garbageCollect();
+                        hook.detach();
+                }
+        }
 
-                },
-                onLeave: function(retval) {
-                        if(!this.inside || (args.end_addr != undefined))return
-                        removeItemOnce(threadIds, Process.getCurrentThreadId())
-                        console.log(`Leaving function`);
-                        removeItemOnce(flushs, this.flush)
-                        Stalker.unfollow(Process.getCurrentThreadId());
-                        Stalker.flush();
-                        this.flush()
-                        if (once) {
-                                Stalker.garbageCollect();
-                                hook.detach();
-                        }
-                },
+        hook = Interceptor.attach(base.add(addr), {
+                onEnter: onEnter,
+                onLeave: onLeave,
         });
 
         return 0;
