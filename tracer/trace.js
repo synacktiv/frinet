@@ -1,19 +1,11 @@
 var c_src;
 var js_src;
-var threadIds = []
-var flushs = [];
+var threadIds = new Set();
+var flushMap = new Map();
 
 function sendSrc(args) {
         if(args["is_c"])c_src = args["src"];
         else js_src = args["src"];
-}
-
-function removeItemOnce(arr, value) {
-        var index = arr.indexOf(value);
-        if (index > -1) {
-                arr.splice(index, 1);
-        }
-        return arr;
 }
 
 
@@ -135,40 +127,43 @@ function trace(args) {
                 
                 return [flush, transform]
         }
-        
+
         Process.setExceptionHandler(function (details) {
                 console.log(`Got exception : flushing Stalker`);
                 Stalker.flush();
-                for(let flush of flushs)
-                        flush()
+                for (let flush of flushMap.values())
+  		    flush();
         })
 
         var hook
         var filter_tid = -1
         var onEnter = function(args) {
                 this.inside = false
-                let curpid = Process.getCurrentThreadId()
-                if(threadIds.includes(curpid) || (filter_tid>=0 && filter_tid != curpid))return
-                this.inside = true
-                console.log(`Entering function`);
-                threadIds.push(curpid)
-                let stalk = getstalker(curpid)
-                this.flush = stalk[0]
-                flushs.push(this.flush)
-                Stalker.follow(curpid, {transform: stalk[1]});
+                let curpid = Process.getCurrentThreadId();
+		if (threadIds.has(curpid) || (filter_tid >= 0 && filter_tid != curpid)) return;
+		this.inside = true;
+		console.log(`Entering function`);
+		threadIds.add(curpid);
+		let stalk = getstalker(curpid);
+		this.flush = stalk[0];
+		flushMap.set(curpid, this.flush);
+		Stalker.follow(curpid, { transform: stalk[1] });
         }
         var onLeave = function(retval) {
-                if(!this.inside || (args.end_addr != undefined))return
-                removeItemOnce(threadIds, Process.getCurrentThreadId())
-                console.log(`Leaving function`);
-                removeItemOnce(flushs, this.flush)
-                Stalker.unfollow(Process.getCurrentThreadId());
-                Stalker.flush();
-                this.flush()
-                if (once) {
-                        Stalker.garbageCollect();
-                        hook.detach();
-                }
+                if (!this.inside || (args.end_addr != undefined)) return;
+
+		let curpid = Process.getCurrentThreadId();
+		console.log(`Leaving function`);
+		threadIds.delete(curpid);
+		flushMap.get(curpid)?.();
+		flushMap.delete(curpid);
+		Stalker.unfollow(curpid);
+		Stalker.flush();
+
+		if (once) {
+		    Stalker.garbageCollect();
+		    hook.detach();
+		}
         }
 
         hook = Interceptor.attach(base.add(addr), {
@@ -180,12 +175,14 @@ function trace(args) {
 }
 
 function end()
-{       
-        for(let t of threadIds)
-        {
-                Stalker.unfollow(t);
-        }
-        Stalker.flush();
+{
+        for (let t of threadIds) {
+	    Stalker.unfollow(t);
+	    flushMap.get(t)?.();
+	}
+	Stalker.flush();
+	threadIds.clear();
+	flushMap.clear();
 }
 
 function arch()
