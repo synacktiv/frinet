@@ -283,7 +283,7 @@ mem_size(const cs_insn *insn, cs_arm64_op *op)
         case ARM64_REG_D0 ... ARM64_REG_D31:
                 return 8 * regs;
         case ARM64_REG_Q0 ... ARM64_REG_Q31:
-                return 16;
+                return 16 * regs;
         default:
                 return 8 * regs;
         }

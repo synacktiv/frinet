@@ -48,14 +48,16 @@ function trace(args) {
                                 });
                         }
                 }
-                else
+                else if(traced_base == -1)
                 {
                         traced_base = mod.base
                         traced_end = mod.base.add(mod.size);
                 }
 
                 if ((mod.name == module)) {
-                        base = mod.base;
+                        if(base != -1)
+                                console.log("WARNING : The same module name is present twice ! ("+base+" vs "+mod.base+"). Keeping the first one...")
+                        else base = mod.base;
                 }
         });
 
