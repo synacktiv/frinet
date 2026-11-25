@@ -41,7 +41,7 @@ def file_append(path: str, data: str, is_modules: bool):
     else:
         last_trace = filepath
 
-    with open(filepath, 'a') as fd:
+    with open(filepath, 'a', newline='') as fd:
         return fd.write(data)
 
 
