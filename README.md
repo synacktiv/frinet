@@ -63,6 +63,20 @@ cargo run --bin frinet --release -- index --format tenet tracer/traces/ls_xxxx.t
 # 3. Open the trace in IDA (File > Load File > Open Frinet DB...)
 ```
 
+### Tracing a process started by another program
+
+Some programs are only meant to be launched by another process (a launcher, an IDE plugin, a service...) and cannot be spawned on their own. The `child` mode attaches to the parent with Frida child gating, catches the target suspended as soon as the parent starts it, installs the hook and resumes it, so even startup code is traced:
+
+```bash
+# Wait for bds.exe to start PexRunner64.exe, then trace PexRunner64.exe+0x2E41C0
+python tracer/trace.py child bds.exe PexRunner64.exe 0x2E41C0
+
+# If the hooked module is not the child executable itself, name the child with -c
+python tracer/trace.py -c launcher_child.exe child launcher.exe mylib.dll 0x1234
+```
+
+Other children started by the parent while waiting are resumed untouched.
+
 ## Testing & Fuzzing & Benchmark
 
 ```bash
