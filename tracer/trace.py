@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import pathlib
+import queue
 import frida
 from slow.trace_slow import do_slowmode_output
 from utils import print_lib_usage
@@ -51,7 +52,10 @@ def do_spawn(args):
 def do_attach(args):
     do_trace(args, True)
 
-def do_trace(args, attach):
+def do_child(args):
+    do_trace(args, False, child=True)
+
+def do_trace(args, attach, child=False):
     global arch, slide
     devmgr = frida.get_device_manager()
 
@@ -88,7 +92,30 @@ def do_trace(args, attach):
         process = args.process
         procname = process
 
-        if attach :
+        psess = None
+        if child:
+            # Attach to the parent with child gating, and catch the target suspended
+            # as soon as the parent starts it.
+            parent = int(process) if process.isnumeric() else process
+            want = (args.child or args.module).lower()
+            children = queue.Queue()
+            dev.on('child-added', lambda ch: children.put(ch))
+            logging.info(f'Attaching to parent {parent!r} with child gating...')
+            psess = dev.attach(parent)
+            psess.enable_child_gating()
+            logging.info(f'Waiting for {want} to be started by the parent...')
+            while True:
+                ch = children.get()
+                path = ch.path or ch.identifier or ''
+                name = re.split(r'[\\/]', path)[-1].lower()
+                if name == want:
+                    logging.info(f'Caught child {path} (PID {ch.pid}).')
+                    process = ch.pid
+                    procname = name
+                    break
+                logging.info(f'Ignoring child {path} (PID {ch.pid}).')
+                dev.resume(ch.pid)
+        elif attach :
             if process.isnumeric():
                 process = int(process)
                 logging.info(f'Attaching to PID {process}...')
@@ -228,6 +255,14 @@ def do_trace(args, attach):
 
         if not attach:
             dev.resume(process)
+        if psess is not None:
+            # Stop gating only after the target is resumed (pending children are
+            # forgotten otherwise), and release any other children caught meanwhile.
+            psess.disable_child_gating()
+            while not children.empty():
+                try: dev.resume(children.get_nowait().pid)
+                except frida.InvalidArgumentError: pass
+            psess.detach()
 
         logging.info("CTRL+C to interrupt trace")
         try:
@@ -341,14 +376,21 @@ def main():
         help="Module name to trace PC from, equal to module argument by default, '*' for ALL modules. '*' will also create a file containing the module map, and summarize which libs were present in the trace"
     )
 
+    parser.add_argument(
+        '-c', '--child',
+        type=str,
+        help='child mode: executable name of the child to catch (default: module name)'
+    )
+
     sp = parser.add_subparsers()
     sp_spawn = sp.add_parser('spawn', help='Spawn process')
     sp_attach = sp.add_parser('attach', help='Attach to process')
+    sp_child = sp.add_parser('child', help='Attach to a parent process and trace the child it starts')
 
     parser.add_argument(
         'process',
         type=str,
-        help='attach:[process name or PID]; spawn:[binary path or package name]'
+        help='attach:[process name or PID]; spawn:[binary path or package name]; child:[parent process name or PID]'
     )
 
     parser.add_argument(
@@ -365,6 +407,7 @@ def main():
 
     sp_spawn.set_defaults(func=do_spawn)
     sp_attach.set_defaults(func=do_attach)
+    sp_child.set_defaults(func=do_child)
 
     args = parser.parse_args()
 
