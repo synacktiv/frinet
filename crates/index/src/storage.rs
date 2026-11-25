@@ -59,6 +59,12 @@ impl DbStorage for OnDisk {
     }
 
     fn truncate(&mut self, size: usize) {
+        // Windows cannot resize a file while a mapped view is open (os error 1224):
+        // flush and unmap first.
+        if let Some(mmap) = self.mmap.take() {
+            mmap.flush().unwrap();
+            drop(mmap);
+        }
         self.file.as_mut().unwrap().set_len(size as _).unwrap();
     }
 }
