@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import pathlib
+import queue
 import frida
 from slow.trace_slow import do_slowmode_output
 from utils import print_lib_usage
@@ -41,7 +42,7 @@ def file_append(path: str, data: str, is_modules: bool):
     else:
         last_trace = filepath
 
-    with open(filepath, 'a') as fd:
+    with open(filepath, 'a', newline='') as fd:  # keep LF line endings on Windows
         return fd.write(data)
 
 
@@ -51,7 +52,10 @@ def do_spawn(args):
 def do_attach(args):
     do_trace(args, True)
 
-def do_trace(args, attach):
+def do_child(args):
+    do_trace(args, False, child=True)
+
+def do_trace(args, attach, child=False):
     global arch, slide
     devmgr = frida.get_device_manager()
 
@@ -88,7 +92,28 @@ def do_trace(args, attach):
         process = args.process
         procname = process
 
-        if attach :
+        if child:
+            # Wait for the parent (e.g. bds.exe) to start the target, catch it suspended
+            parent = int(process) if process.isnumeric() else process
+            want = (args.child or args.module).lower()
+            children = queue.Queue()
+            dev.on('child-added', lambda ch: children.put(ch))
+            logging.info(f'Attaching to parent {parent!r} with child gating...')
+            psess = dev.attach(parent)
+            psess.enable_child_gating()
+            logging.info(f'Waiting for {want} to be started by the parent. Start it now...')
+            while True:
+                ch = children.get()
+                path = ch.path or ch.identifier or ''
+                name = re.split(r'[\\/]', path)[-1].lower()
+                if name == want:
+                    logging.info(f'Caught child {path} (PID {ch.pid}).')
+                    process = ch.pid
+                    procname = name
+                    break
+                logging.info(f'Ignoring child {path} (PID {ch.pid}).')
+                dev.resume(ch.pid)
+        elif attach :
             if process.isnumeric():
                 process = int(process)
                 logging.info(f'Attaching to PID {process}...')
@@ -107,9 +132,11 @@ def do_trace(args, attach):
             if args.args:
                 argv = args.args.split(",")
             procname = process.split("/")[-1]
-            process = int(dev.spawn(process, argv=argv, env={}, cwd=None, stdio="pipe"))
+            process = int(dev.spawn(process, argv=argv, cwd=args.cwd or os.path.dirname(process) or None, stdio="pipe"))
             logging.info("Spawning process ")
         sess = dev.attach(process)
+        if not child:
+            psess = None
 
         # TODO: refactor + cleanup...
         epoch = str(int(time.time()))
@@ -227,7 +254,21 @@ def do_trace(args, attach):
             return 1
 
         if not attach:
-            dev.resume(process)
+            try:
+                dev.resume(process)
+            except frida.InvalidArgumentError:
+                logging.warning('Process was already running (could not resume it).')
+        if child and psess is not None:
+            # Stop gating only after the target is resumed, and release any other caught children
+            try:
+                psess.disable_child_gating()
+                while not children.empty():
+                    other = children.get_nowait()
+                    try: dev.resume(other.pid)
+                    except frida.InvalidArgumentError: pass
+                psess.detach()
+            except frida.InvalidOperationError:
+                pass
 
         logging.info("CTRL+C to interrupt trace")
         try:
@@ -341,9 +382,22 @@ def main():
         help="Module name to trace PC from, equal to module argument by default, '*' for ALL modules. '*' will also create a file containing the module map, and summarize which libs were present in the trace"
     )
 
+    parser.add_argument(
+        '-C', '--cwd',
+        type=str,
+        help='spawn: working directory for the process (default: the exe folder)'
+    )
+
+    parser.add_argument(
+        '-c', '--child',
+        type=str,
+        help='child mode: exe name of the child to catch (default: module name)'
+    )
+
     sp = parser.add_subparsers()
     sp_spawn = sp.add_parser('spawn', help='Spawn process')
     sp_attach = sp.add_parser('attach', help='Attach to process')
+    sp_child = sp.add_parser('child', help='Attach to a parent process (e.g. bds.exe) and trace the child it starts')
 
     parser.add_argument(
         'process',
@@ -365,6 +419,7 @@ def main():
 
     sp_spawn.set_defaults(func=do_spawn)
     sp_attach.set_defaults(func=do_attach)
+    sp_child.set_defaults(func=do_child)
 
     args = parser.parse_args()
 
