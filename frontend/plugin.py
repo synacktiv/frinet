@@ -14,6 +14,7 @@ from register_widget import RegistersWidget
 from timeline_widget import TimelineDock
 from memory_widget import MemoryWidget
 from search_results_widget import SearchResultsWidget
+from calltree_widget import CallTreeWidget
 
 
 class IdaDecompiler(IDecompiler):
@@ -25,6 +26,7 @@ class IdaDecompiler(IDecompiler):
         self.registers_windows = []
         self.memory_windows = []
         self.search_results_windows = []
+        self.calltree_windows = []
 
     def navigate_to_addr(self, addr):
         widget = ida_kernwin.find_widget("IDA View-A")
@@ -45,6 +47,18 @@ class IdaDecompiler(IDecompiler):
         )
         window.show()
         self.search_results_windows.append(window)
+
+    def open_calltree_window(self, path):
+        try:
+            widget = CallTreeWidget(self.ctx, self.navigate_to_addr, path)
+        except Exception as e:
+            print(f"[frinet] cannot open call list {path}: {e}")
+            return
+        title = "Call tree - " + os.path.basename(path)
+        window = DockableWindow(title, widget)
+        window.show()
+        window.set_dock_position("IDA View-A", ida_kernwin.DP_RIGHT)
+        self.calltree_windows.append(window)
 
     def open_timeline_window(self):
         window = TimelineDock(self.ctx)
@@ -97,12 +111,8 @@ class FilePicker:
             default_folder = idautils.GetIdbDir()
         self._last_directory = default_folder
 
-    def pick_file(self) -> str | None:
-        dialog = QtWidgets.QFileDialog(
-            None, "Open Frinet DB file", self._last_directory, "All Files (*.*)"
-        )
-        dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
-        path, _ = dialog.getOpenFileName()
+    def pick_file(self, title="Open Frinet DB file", filter="All Files (*.*)") -> str | None:
+        path, _ = QFileDialog.getOpenFileName(None, title, self._last_directory, filter)
 
         if path is not None and len(path) > 0:
             self._last_directory = os.path.dirname(path) + os.sep
@@ -255,6 +265,13 @@ class FrinetIDAPlugin(ida_idaapi.plugin_t):
             tooltip="Open a Frinet DB (indexed trace)",
             menu_path="File/Load file/",
         )
+        self.open_calltree = Action(
+            action_id="frinet:open_calltree",
+            label="Open Frinet ~c~all tree...",
+            callback=self.pick_and_open_calltree,
+            tooltip="Open a .calls.txt call list as a navigable tree",
+            menu_path="File/Load file/",
+        )
         self.prev_exec = Action(
             action_id="frinet:prev_execution",
             label="Go to prev execution",
@@ -282,6 +299,7 @@ class FrinetIDAPlugin(ida_idaapi.plugin_t):
 
         self.all_actions = [
             self.open_db,
+            self.open_calltree,
             self.prev_exec,
             self.next_exec,
             self.first_exec,
@@ -333,6 +351,14 @@ class FrinetIDAPlugin(ida_idaapi.plugin_t):
         if not path:
             return
         self.ctx.open_db(path)
+
+    def pick_and_open_calltree(self) -> None:
+        path = self.file_picker.pick_file(
+            "Open Frinet call list", "Call lists (*.calls.txt *.txt);;All Files (*.*)"
+        )
+        if not path:
+            return
+        self.decompiler.open_calltree_window(path)
 
     def term(self) -> None:
         print("frinet::term()")
