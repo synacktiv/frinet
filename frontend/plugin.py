@@ -7,6 +7,7 @@ import os
 
 import ida_idaapi
 import ida_kernwin
+import ida_nalt
 import idautils
 
 from core import Ctx, IDecompiler, Db
@@ -40,6 +41,9 @@ class IdaDecompiler(IDecompiler):
 
     def refresh_view(self):
         ida_kernwin.refresh_idaview_anyway()
+
+    def image_base(self) -> int:
+        return ida_nalt.get_imagebase()
 
     def open_search_results_window(self, results):
         window = DockableWindow(
