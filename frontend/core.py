@@ -133,6 +133,16 @@ class Ctx:
     def unregister_time_observer(self, observers: TimeObserver) -> None:
         self._time_observers.remove(observers)
 
+    def goto_memory(self, addr: int, size: int = 1) -> None:
+        """Show <addr> in the memory window(s)."""
+        for observer in list(self._time_observers):
+            goto = getattr(observer, "goto_address", None)
+            if goto is not None:
+                try:
+                    goto(addr, size)
+                except Exception as err:
+                    print(err)
+
     def search(self, query: str, is_regex: bool) -> None:
         try:
             results = self.db.frinet_db.search(query, regex=is_regex)

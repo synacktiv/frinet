@@ -301,6 +301,7 @@ class MemoryWidget(QAbstractScrollArea):
         self.num_bytes_per_line = 16
         self.pointer_size = 8
         self.breakpoints = []
+        self.follow_accesses = True   # jump to the bytes read/written at the current time
         self._last_plan = None
         self.selection_model = SelectionModel()
 
@@ -346,6 +347,9 @@ class MemoryWidget(QAbstractScrollArea):
         self._action_break_read = QAction("Break on reads", self)
         self._action_break_write = QAction("Break on writes", self)
         self._action_remove_bp = QAction("Remove breakpoint", self)
+        self._action_follow = QAction("Follow memory accesses", self)
+        self._action_follow.setCheckable(True)
+        self._action_follow.setChecked(self.follow_accesses)
 
     def get_first_breakpoint_at(self, address: int) -> Optional[Breakpoint]:
         """Returns the first breakpoint matching the given address."""
@@ -409,10 +413,16 @@ class MemoryWidget(QAbstractScrollArea):
 
         menu.addAction(self._action_goto)
         menu.addAction(self._action_search)
+        menu.addSeparator()
+        menu.addAction(self._action_follow)
 
         action: Optional[QAction] = menu.exec(self.mapToGlobal(position))
 
-        if action == self._action_goto:
+        if action == self._action_follow:
+            self.follow_accesses = self._action_follow.isChecked()
+            if self.follow_accesses:
+                self.on_time_update()
+        elif action == self._action_goto:
             self._prompt_goto_address()
         elif action == self._action_search:
             self._prompt_search()
@@ -495,6 +505,25 @@ class MemoryWidget(QAbstractScrollArea):
         self.setMinimumWidth(int(plan.total_width))
 
     def on_time_update(self) -> None:
+        if self.follow_accesses:
+            try:
+                access = find_access_at(self.ctx.db.frinet_db, self.ctx.db.time)
+            except Exception as err:
+                print("[frinet] follow memory:", err)
+                access = None
+            if access is not None:
+                addr, size, _is_write = access
+                self.goto_address(addr, size)
+                return
+        if self.viewport():
+            self.viewport().update()
+
+    def goto_address(self, addr: int, size: int = 1) -> None:
+        """Scroll to <addr> (two lines of context above) and select <size> bytes."""
+        line = addr - (addr % self.num_bytes_per_line)
+        self.base_addr = max(0, line - 2 * self.num_bytes_per_line)
+        self.selection_model.anchor = addr
+        self.selection_model.current = addr + max(1, size) - 1
         if self.viewport():
             self.viewport().update()
 
@@ -755,6 +784,50 @@ class MemoryWidget(QAbstractScrollArea):
         self._addr_painter.paint(painter, plan, plan.addr_panel.x)
         self._hex_painter.paint(painter, plan, plan.hex_panel, data)
         self._ascii_painter.paint(painter, plan, plan.ascii_panel, data)
+
+
+ADDR_MAX = (1 << 64) - 1
+
+
+def _make_hit(func, t: int):
+    """hit(lo, hi): does an access happen at exactly time t inside [lo, hi]?
+    Works whether next_mem_* is inclusive or exclusive on time / range end."""
+    def hit(lo: int, hi: int) -> bool:
+        lo, hi = max(0, lo), min(ADDR_MAX, hi)
+        if lo > hi:
+            return False
+        if t > 0 and func(t - 1, (lo, hi)) == t:
+            return True
+        return func(t, (lo, hi)) == t
+    return hit
+
+
+def find_access_at(frinet_db, t: int):
+    """(addr, size, is_write) of the memory access done at time t, or None.
+    Binary search over the address space with next_mem_write/next_mem_read
+    (address ranges are inclusive, as frinet's own breakpoints use them)."""
+    for func, is_write in ((frinet_db.next_mem_write, True), (frinet_db.next_mem_read, False)):
+        hit = _make_hit(func, t)
+        if not hit(0, ADDR_MAX):
+            continue
+        lo, hi = 0, ADDR_MAX            # first byte: smallest c with hit(0, c)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if hit(0, mid):
+                hi = mid
+            else:
+                lo = mid + 1
+        start = lo
+        lo, hi = start, ADDR_MAX        # last byte: largest c with hit(c, MAX)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if hit(mid, ADDR_MAX):
+                lo = mid
+            else:
+                hi = mid - 1
+        size = min(64, lo - start + 1)
+        return start, size, is_write
+    return None
 
 
 def continious_ranges_from_mem_nodes(nodes: list[MemNode]) -> list[tuple[int, int]]:
