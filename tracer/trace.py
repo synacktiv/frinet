@@ -11,6 +11,7 @@ import queue
 import frida
 from slow.trace_slow import do_slowmode_output
 from utils import print_lib_usage
+import calltree
 
 wd = os.path.dirname(os.path.abspath(__file__))
 MODULE_JS_PATH = os.path.join(wd,'trace.js')
@@ -30,6 +31,7 @@ def file_read(path: str) -> str:
 
 last_modules = None
 last_trace = None
+trace_files = {}   # tid -> .tenet path written in this session
 def file_append(path: str, data: str, is_modules: bool):
     global last_modules, last_trace
     root_dir = os.path.dirname(os.path.realpath(__file__))
@@ -143,6 +145,8 @@ def do_trace(args, attach, child=False):
         slide = None # ASLR slide
         seen_tids = set() # seen thread IDs
         midline_break = {}
+        calls_line_offset = {}  # tid -> line number of the first traced instruction - 1
+        calls_started = set()
         logging.info('Loading JS module...')
         script = sess.create_script(file_read(MODULE_JS_PATH))
         def on_message(msg, data):
@@ -182,12 +186,34 @@ def do_trace(args, attach, child=False):
                         logging.info(f'Received trace data for new thread {tid}.')
                         if slide is None:
                             logging.warning(f'ASLR slide is not known.')
+                            calls_line_offset[tid] = 1
                         else:
                             data = f'slide=0x{slide:x}\n'+data
+                            calls_line_offset[tid] = 2
                         seen_tids.add(tid)
+                        trace_files[tid] = path
                     midline_break[tid] = data[-1]!="\n"
                     logging.info(f'Writing trace data of {len(data)} bytes...')
                     file_append(path, data, False)
+                    return
+                elif payload['id'] == 'calls':
+                    # call list recorded by the tracer (no exe copy needed)
+                    tid = payload['tid']
+                    tpath = f'{TRACES_DIR}/'+re.sub("[^a-zA-Z_0-9.]","",f'{procname}_{epoch}_{tid}.tenet')
+                    cpath = calltree.calls_path(tpath)
+                    out = []
+                    if tid not in calls_started:
+                        calls_started.add(tid)
+                        out.append(calltree.HEADER.format(trace=os.path.basename(tpath)))
+                        out.append(f'{"":15}{args.module}+{args.addr}  (traced function)\n')
+                    off = calls_line_offset.get(tid, 1)
+                    for ln in payload['data'].splitlines():
+                        f = ln.split(' ')
+                        if len(f) != 5:
+                            continue
+                        out.append(calltree.format_event(int(f[0]) + off, f[1], f[2], f[3], f[4]))
+                    with open(cpath, 'a', newline='') as fd:
+                        fd.writelines(out)
                     return
                 elif payload['id'] == 'module':
                     path = f'{TRACES_DIR}/'+re.sub("[^a-zA-Z_0-9.]","",f'{procname}_{epoch}.modules')
@@ -242,6 +268,7 @@ def do_trace(args, attach, child=False):
             'once': not args.multirun,
             'exclude' : args.exclude,
             'needmem' : not args.nomem,
+            'calls' : (not args.exe) and (not args.nocalls) and arch == 'x64' and not args.slow,
             'swap_rw' : 1 if (arch == "arm64" and sysenv['os']['name']=="Android") else 0,
             'slow' : args.slow,
             'end_addr' : int(args.end,16) if args.end else None,
@@ -279,9 +306,14 @@ def do_trace(args, attach, child=False):
         if args.traced_module == "*" and last_modules and last_trace: 
             print_lib_usage(last_trace, last_modules)
 
-        script.exports_sync.end()
-        script.unload()
-        sess.detach()
+        try:
+            script.exports_sync.end()
+            script.unload()
+            sess.detach()
+        except (frida.InvalidOperationError, frida.TransportError) as exc:
+            logging.info(f'Process already gone ({exc}).')
+
+        write_calls_from_exe(args)
     except frida.ServerNotRunningError as exc:
         logging.error(f'Cannot connect to remote frida server: `{exc}`.')
         return 1
@@ -299,6 +331,25 @@ def do_trace(args, attach, child=False):
         return 1
 
     return 0
+
+
+def write_calls_from_exe(args):
+    """-X/--exe: build the .calls.txt files from the traces and the exe copy."""
+    if not args.exe:
+        return
+    if args.traced_module == '*':
+        logging.warning('--exe: call list is only built when a single module is traced.')
+        return
+    try:
+        start = int(args.addr, 0)
+    except ValueError:
+        start = None
+    for tid, tpath in trace_files.items():
+        try:
+            out = calltree.build_from_exe(args.exe, tpath, None, start)
+            logging.info(f'Call list written: {out}')
+        except Exception as exc:
+            logging.error(f'Could not build call list for {tpath}: {exc}')
 
 
 def main():
@@ -380,6 +431,19 @@ def main():
         '-t', '--traced-module',
         type=str,
         help="Module name to trace PC from, equal to module argument by default, '*' for ALL modules. '*' will also create a file containing the module map, and summarize which libs were present in the trace"
+    )
+
+    parser.add_argument(
+        '-X', '--exe',
+        type=str,
+        help='path to a copy of the traced exe: the call list (.calls.txt) is built from it after tracing. '
+             'Without it, the tracer records calls itself while tracing (x64, fast mode)'
+    )
+
+    parser.add_argument(
+        '--nocalls',
+        action='store_true',
+        help='do not record the call list while tracing'
     )
 
     parser.add_argument(
