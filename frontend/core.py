@@ -175,11 +175,20 @@ class Ctx:
 
         db._current_time = new_time
 
-        for observer in self._time_observers:
+        dead = []
+        for observer in list(self._time_observers):
             try:
                 observer.on_time_update()
+            except RuntimeError as err:
+                # window was closed by IDA: its Qt object is gone, forget it
+                if "already deleted" in str(err):
+                    dead.append(observer)
+                else:
+                    print(err)
             except Exception as err:
                 print(err)
+        for observer in dead:
+            self._time_observers.discard(observer)
 
         pc = db.pc_at(new_time)
         if pc is not None:
