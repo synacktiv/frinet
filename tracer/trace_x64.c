@@ -8,6 +8,12 @@
 
 #define CTX_INSN_REGS_MAX       32
 #define CTX_INSN_MEMS_MAX       2
+#define CALL_STACK_MAX          512
+
+/* call recording (frinet .calls.txt): kind of instruction */
+#define KIND_OTHER 0
+#define KIND_CALL  1
+#define KIND_RET   2
 
 
 struct ctx_insn_mem {
@@ -25,12 +31,16 @@ struct ctx_insn {
         gsize                   n_mems;
         char call_instruction;
         bool enable_regs;
+        char kind;              /* KIND_* */
+        guint8 insn_size;
+        cs_x86_op target_op;    /* operand of a call */
 };
 
 struct ctx_trace {
         gboolean init;
         guint64 rip;
         struct ctx_insn ctx_insn;
+        guint64 call_target;    /* resolved target of a call */
 };
 
 struct state {
@@ -40,6 +50,11 @@ struct state {
         char dump_all_regs;
         bool exclude;
         bool needmem;
+        bool calls;             /* record call/ret events */
+        GString *calls_buf;
+        guint64 line;           /* number of trace lines emitted */
+        guint64 ret_stack[CALL_STACK_MAX];
+        gsize depth;
 };
 
 
@@ -49,6 +64,8 @@ extern bool exclude();
 extern bool needmem();
 extern char swap_rw();
 extern void send(gchar *str);
+extern bool calls();
+extern void send_calls(gchar *str);
 
 
 void init(void);
@@ -334,6 +351,71 @@ static inline void print_trace_line_cmp(GumCpuContext *cpu_ctx, x86_reg reg)
         }
 }
 
+static guint64
+call_target(const GumCpuContext *cpu_ctx, const struct ctx_insn *ci)
+{
+        const cs_x86_op *op = &ci->target_op;
+        guint64 addr = 0;
+
+        switch (op->type) {
+        case X86_OP_IMM:
+                return (guint64)op->imm;
+        case X86_OP_REG:
+                return ctx_reg_read(cpu_ctx, op->reg);
+        case X86_OP_MEM:
+                if (op->mem.segment != X86_REG_INVALID)
+                        return 0;
+                if (op->mem.base == X86_REG_RIP)
+                        addr = cpu_ctx->rip + ci->insn_size;
+                else if (op->mem.base != X86_REG_INVALID)
+                        addr = ctx_reg_read(cpu_ctx, op->mem.base);
+                if (op->mem.index != X86_REG_INVALID)
+                        addr += op->mem.scale * ctx_reg_read(cpu_ctx, op->mem.index);
+                addr += op->mem.disp;
+                return *(const guint64 *)addr;   /* the CPU reads it too */
+        default:
+                return 0;
+        }
+}
+
+/* line format: <time> <depth> <call|api|ret> <from> <to> */
+static void
+record_calls(GumCpuContext *cpu_ctx, struct ctx_trace *last, guint64 time)
+{
+        struct ctx_insn *li = &last->ctx_insn;
+        guint64 rip = cpu_ctx->rip;
+        gsize d;
+
+        if (li->kind == KIND_CALL) {
+                guint64 retaddr = last->rip + li->insn_size;
+                if (rip == retaddr && last->call_target != retaddr) {
+                        /* call was not followed (excluded / other module) */
+                        g_string_append_printf(state->calls_buf,
+                                "%zu %zu api 0x%zx 0x%zx\n", time, state->depth,
+                                last->rip, last->call_target);
+                } else {
+                        g_string_append_printf(state->calls_buf,
+                                "%zu %zu call 0x%zx 0x%zx\n", time, state->depth,
+                                last->rip, rip);
+                        if (state->depth < CALL_STACK_MAX)
+                                state->ret_stack[state->depth] = retaddr;
+                        state->depth++;
+                }
+                return;
+        }
+
+        /* returned to a pending return address (by ret, or through untraced code) */
+        for (d = (state->depth < CALL_STACK_MAX ? state->depth : CALL_STACK_MAX); d > 0; --d) {
+                if (state->ret_stack[d - 1] == rip) {
+                        state->depth = d - 1;
+                        g_string_append_printf(state->calls_buf,
+                                "%zu %zu ret 0x%zx 0x%zx\n", time, state->depth,
+                                last->rip, rip);
+                        return;
+                }
+        }
+}
+
 static void
 on_insn(GumCpuContext *cpu_ctx, gpointer user_data)
 {
@@ -392,7 +474,13 @@ on_insn(GumCpuContext *cpu_ctx, gpointer user_data)
                                                       mem->ptr[j] & 0xff);
                 }
 
-                if(last_ctx_insn->enable_regs)g_string_append_c(state->trace, '\n');
+                if(last_ctx_insn->enable_regs)
+                {
+                        g_string_append_c(state->trace, '\n');
+                        if (state->calls)
+                                record_calls(cpu_ctx, last_ctx_trace, state->line);
+                        state->line++;
+                }
         }
 
         /* trace context phase */
@@ -421,6 +509,10 @@ on_insn(GumCpuContext *cpu_ctx, gpointer user_data)
         last_ctx_insn->n_regs = ctx_insn->n_regs;
 
         last_ctx_insn->enable_regs = ctx_insn->enable_regs;
+        last_ctx_insn->kind = ctx_insn->kind;
+        last_ctx_insn->insn_size = ctx_insn->insn_size;
+        if (state->calls && ctx_insn->kind == KIND_CALL)
+                last_ctx_trace->call_target = call_target(cpu_ctx, ctx_insn);
         last_ctx_trace->init = TRUE;
 
         for (i = 0; i < ctx_insn->n_mems; ++i) {
@@ -484,12 +576,15 @@ init(void)
         state->dump_all_regs = 2;
         state->exclude = exclude();
         state->needmem = needmem();
+        state->calls = calls();
+        state->calls_buf = g_string_new(NULL);
 }
 
 void
 finalize(void)
 {
         g_string_free(state->trace, TRUE);
+        g_string_free(state->calls_buf, TRUE);
         g_free(state);
 }
 
@@ -501,6 +596,13 @@ flush(void)
         send(trace);
         g_free(trace);
         state->trace = g_string_new(NULL);
+
+        if (state->calls && state->calls_buf->len) {
+                gchar *calls_str = g_string_free(state->calls_buf, FALSE);
+                send_calls(calls_str);
+                g_free(calls_str);
+                state->calls_buf = g_string_new(NULL);
+        }
 }
 
 void
@@ -593,6 +695,15 @@ transform(GumStalkerIterator *iterator, GumStalkerOutput *output,
                         }
                 }
                 ctx_insn->call_instruction=0;
+                ctx_insn->insn_size = insn->size;
+                ctx_insn->kind = KIND_OTHER;
+                if (insn->id == X86_INS_CALL) {
+                        ctx_insn->kind = KIND_CALL;
+                        if (insn_x86->op_count > 0)
+                                ctx_insn->target_op = insn_x86->operands[0];
+                } else if (insn->id == X86_INS_RET) {
+                        ctx_insn->kind = KIND_RET;
+                }
                 ctx_insn->enable_regs = enable_regs;
                 //if(insn->detail->groups[1] || insn->detail->groups[2] || insn->detail->groups[4] // ARM64_GRP_JMP|CALL|INT (does not work for BR?)
                 // TODO

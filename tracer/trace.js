@@ -25,6 +25,7 @@ function trace(args) {
         var once = args["once"];
         var exclude = args["exclude"];
         var needmem = args["needmem"];
+        var record_calls = !!args["calls"];
 
         var traced_base = traced_module == '*'? 0: -1;
         var traced_end = traced_module == '*'? Infinity: -1;
@@ -69,6 +70,51 @@ function trace(args) {
 
         if(traced_module != '*')send({id: "slide", slide: traced_base});
         
+        // ---- call recording: address -> readable name ----
+        var symCache = {}
+        var imageBases = {}
+        function idaBase(mod) {
+                // preferred ImageBase from the PE header, so names match IDA (sub_14000E424)
+                if (mod.name in imageBases) return imageBases[mod.name]
+                var ib = null
+                try {
+                        if (Process.platform === 'windows') {
+                                var pe = mod.base.add(mod.base.add(0x3c).readU32())
+                                var magic = pe.add(0x18).readU16()
+                                ib = (magic === 0x20b) ? pe.add(0x30).readU64() : uint64(pe.add(0x34).readU32())
+                        }
+                } catch (e) { ib = null }
+                imageBases[mod.name] = ib
+                return ib
+        }
+        function symName(addrStr) {
+                if (addrStr in symCache) return symCache[addrStr]
+                var p = ptr(addrStr)
+                var res = addrStr
+                var mod = Process.findModuleByAddress(p)
+                if (mod !== null) {
+                        var off = p.sub(mod.base)
+                        var sym = null
+                        try { sym = DebugSymbol.fromAddress(p) } catch (e) {}
+                        if (sym && sym.name && !/^0x[0-9a-f]+$/i.test(sym.name) && sym.address.equals(p))
+                                res = mod.name + '!' + sym.name
+                        else if (mod.name === traced_module && idaBase(mod) !== null)
+                                res = 'sub_' + idaBase(mod).add(off).toString(16).toUpperCase()
+                        else
+                                res = mod.name + '+0x' + off.toString(16).toUpperCase()
+                }
+                symCache[addrStr] = res
+                return res
+        }
+        function codeAddr(addrStr) {
+                // address of the call instruction, in IDA terms when possible
+                var p = ptr(addrStr)
+                var mod = Process.findModuleByAddress(p)
+                if (mod !== null && idaBase(mod) !== null)
+                        return idaBase(mod).add(p.sub(mod.base)).toString(16).toUpperCase()
+                return addrStr
+        }
+
         var slow = args.slow
         var cmods = []
         var getstalker = (mytid) => {
@@ -112,6 +158,19 @@ function trace(args) {
                                 'needmem': new NativeCallback(() => {
                                         return needmem ? 1 : 0;
                                 }, 'bool', []),
+                                'calls': new NativeCallback(() => {
+                                        return record_calls ? 1 : 0;
+                                }, 'bool', []),
+                                'send_calls': new NativeCallback(ptr => {
+                                        var lines = ptr.readCString().split('\n')
+                                        var out = []
+                                        for (var l of lines) {
+                                                if (!l) continue
+                                                var f = l.split(' ')   // time depth kind from to
+                                                out.push([f[0], f[1], f[2], codeAddr(f[3]), symName(f[4])].join(' '))
+                                        }
+                                        send({ id: "calls", tid: mytid, data: out.join('\n') + '\n' });
+                                }, 'void', ['pointer']),
                                 'swap_rw': new NativeCallback(() => {
                                         return args["swap_rw"];
                                 }, 'char', []),

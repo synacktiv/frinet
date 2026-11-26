@@ -7,9 +7,11 @@ import os
 import sys
 import time
 import pathlib
+import queue
 import frida
 from slow.trace_slow import do_slowmode_output
 from utils import print_lib_usage
+import calltree
 
 wd = os.path.dirname(os.path.abspath(__file__))
 MODULE_JS_PATH = os.path.join(wd,'trace.js')
@@ -29,6 +31,7 @@ def file_read(path: str) -> str:
 
 last_modules = None
 last_trace = None
+trace_files = {}   # tid -> .tenet path written in this session
 def file_append(path: str, data: str, is_modules: bool):
     global last_modules, last_trace
     root_dir = os.path.dirname(os.path.realpath(__file__))
@@ -41,7 +44,7 @@ def file_append(path: str, data: str, is_modules: bool):
     else:
         last_trace = filepath
 
-    with open(filepath, 'a') as fd:
+    with open(filepath, 'a', newline='') as fd:  # keep LF line endings on Windows
         return fd.write(data)
 
 
@@ -51,7 +54,10 @@ def do_spawn(args):
 def do_attach(args):
     do_trace(args, True)
 
-def do_trace(args, attach):
+def do_child(args):
+    do_trace(args, False, child=True)
+
+def do_trace(args, attach, child=False):
     global arch, slide
     devmgr = frida.get_device_manager()
 
@@ -88,7 +94,28 @@ def do_trace(args, attach):
         process = args.process
         procname = process
 
-        if attach :
+        if child:
+            # Wait for the parent (e.g. bds.exe) to start the target, catch it suspended
+            parent = int(process) if process.isnumeric() else process
+            want = (args.child or args.module).lower()
+            children = queue.Queue()
+            dev.on('child-added', lambda ch: children.put(ch))
+            logging.info(f'Attaching to parent {parent!r} with child gating...')
+            psess = dev.attach(parent)
+            psess.enable_child_gating()
+            logging.info(f'Waiting for {want} to be started by the parent. Start it now...')
+            while True:
+                ch = children.get()
+                path = ch.path or ch.identifier or ''
+                name = re.split(r'[\\/]', path)[-1].lower()
+                if name == want:
+                    logging.info(f'Caught child {path} (PID {ch.pid}).')
+                    process = ch.pid
+                    procname = name
+                    break
+                logging.info(f'Ignoring child {path} (PID {ch.pid}).')
+                dev.resume(ch.pid)
+        elif attach :
             if process.isnumeric():
                 process = int(process)
                 logging.info(f'Attaching to PID {process}...')
@@ -107,15 +134,19 @@ def do_trace(args, attach):
             if args.args:
                 argv = args.args.split(",")
             procname = process.split("/")[-1]
-            process = int(dev.spawn(process, argv=argv, env={}, cwd=None, stdio="pipe"))
+            process = int(dev.spawn(process, argv=argv, cwd=args.cwd or os.path.dirname(process) or None, stdio="pipe"))
             logging.info("Spawning process ")
         sess = dev.attach(process)
+        if not child:
+            psess = None
 
         # TODO: refactor + cleanup...
         epoch = str(int(time.time()))
         slide = None # ASLR slide
         seen_tids = set() # seen thread IDs
         midline_break = {}
+        calls_line_offset = {}  # tid -> line number of the first traced instruction - 1
+        calls_started = set()
         logging.info('Loading JS module...')
         script = sess.create_script(file_read(MODULE_JS_PATH))
         def on_message(msg, data):
@@ -155,12 +186,34 @@ def do_trace(args, attach):
                         logging.info(f'Received trace data for new thread {tid}.')
                         if slide is None:
                             logging.warning(f'ASLR slide is not known.')
+                            calls_line_offset[tid] = 1
                         else:
                             data = f'slide=0x{slide:x}\n'+data
+                            calls_line_offset[tid] = 2
                         seen_tids.add(tid)
+                        trace_files[tid] = path
                     midline_break[tid] = data[-1]!="\n"
                     logging.info(f'Writing trace data of {len(data)} bytes...')
                     file_append(path, data, False)
+                    return
+                elif payload['id'] == 'calls':
+                    # call list recorded by the tracer (no exe copy needed)
+                    tid = payload['tid']
+                    tpath = f'{TRACES_DIR}/'+re.sub("[^a-zA-Z_0-9.]","",f'{procname}_{epoch}_{tid}.tenet')
+                    cpath = calltree.calls_path(tpath)
+                    out = []
+                    if tid not in calls_started:
+                        calls_started.add(tid)
+                        out.append(calltree.HEADER.format(trace=os.path.basename(tpath)))
+                        out.append(f'{"":15}{args.module}+{args.addr}  (traced function)\n')
+                    off = calls_line_offset.get(tid, 1)
+                    for ln in payload['data'].splitlines():
+                        f = ln.split(' ')
+                        if len(f) != 5:
+                            continue
+                        out.append(calltree.format_event(int(f[0]) + off, f[1], f[2], f[3], f[4]))
+                    with open(cpath, 'a', newline='') as fd:
+                        fd.writelines(out)
                     return
                 elif payload['id'] == 'module':
                     path = f'{TRACES_DIR}/'+re.sub("[^a-zA-Z_0-9.]","",f'{procname}_{epoch}.modules')
@@ -215,6 +268,7 @@ def do_trace(args, attach):
             'once': not args.multirun,
             'exclude' : args.exclude,
             'needmem' : not args.nomem,
+            'calls' : (not args.exe) and (not args.nocalls) and arch == 'x64' and not args.slow,
             'swap_rw' : 1 if (arch == "arm64" and sysenv['os']['name']=="Android") else 0,
             'slow' : args.slow,
             'end_addr' : int(args.end,16) if args.end else None,
@@ -227,7 +281,21 @@ def do_trace(args, attach):
             return 1
 
         if not attach:
-            dev.resume(process)
+            try:
+                dev.resume(process)
+            except frida.InvalidArgumentError:
+                logging.warning('Process was already running (could not resume it).')
+        if child and psess is not None:
+            # Stop gating only after the target is resumed, and release any other caught children
+            try:
+                psess.disable_child_gating()
+                while not children.empty():
+                    other = children.get_nowait()
+                    try: dev.resume(other.pid)
+                    except frida.InvalidArgumentError: pass
+                psess.detach()
+            except frida.InvalidOperationError:
+                pass
 
         logging.info("CTRL+C to interrupt trace")
         try:
@@ -238,9 +306,14 @@ def do_trace(args, attach):
         if args.traced_module == "*" and last_modules and last_trace: 
             print_lib_usage(last_trace, last_modules)
 
-        script.exports_sync.end()
-        script.unload()
-        sess.detach()
+        try:
+            script.exports_sync.end()
+            script.unload()
+            sess.detach()
+        except (frida.InvalidOperationError, frida.TransportError) as exc:
+            logging.info(f'Process already gone ({exc}).')
+
+        write_calls_from_exe(args)
     except frida.ServerNotRunningError as exc:
         logging.error(f'Cannot connect to remote frida server: `{exc}`.')
         return 1
@@ -258,6 +331,25 @@ def do_trace(args, attach):
         return 1
 
     return 0
+
+
+def write_calls_from_exe(args):
+    """-X/--exe: build the .calls.txt files from the traces and the exe copy."""
+    if not args.exe:
+        return
+    if args.traced_module == '*':
+        logging.warning('--exe: call list is only built when a single module is traced.')
+        return
+    try:
+        start = int(args.addr, 0)
+    except ValueError:
+        start = None
+    for tid, tpath in trace_files.items():
+        try:
+            out = calltree.build_from_exe(args.exe, tpath, None, start)
+            logging.info(f'Call list written: {out}')
+        except Exception as exc:
+            logging.error(f'Could not build call list for {tpath}: {exc}')
 
 
 def main():
@@ -341,9 +433,35 @@ def main():
         help="Module name to trace PC from, equal to module argument by default, '*' for ALL modules. '*' will also create a file containing the module map, and summarize which libs were present in the trace"
     )
 
+    parser.add_argument(
+        '-X', '--exe',
+        type=str,
+        help='path to a copy of the traced exe: the call list (.calls.txt) is built from it after tracing. '
+             'Without it, the tracer records calls itself while tracing (x64, fast mode)'
+    )
+
+    parser.add_argument(
+        '--nocalls',
+        action='store_true',
+        help='do not record the call list while tracing'
+    )
+
+    parser.add_argument(
+        '-C', '--cwd',
+        type=str,
+        help='spawn: working directory for the process (default: the exe folder)'
+    )
+
+    parser.add_argument(
+        '-c', '--child',
+        type=str,
+        help='child mode: exe name of the child to catch (default: module name)'
+    )
+
     sp = parser.add_subparsers()
     sp_spawn = sp.add_parser('spawn', help='Spawn process')
     sp_attach = sp.add_parser('attach', help='Attach to process')
+    sp_child = sp.add_parser('child', help='Attach to a parent process (e.g. bds.exe) and trace the child it starts')
 
     parser.add_argument(
         'process',
@@ -365,6 +483,7 @@ def main():
 
     sp_spawn.set_defaults(func=do_spawn)
     sp_attach.set_defaults(func=do_attach)
+    sp_child.set_defaults(func=do_child)
 
     args = parser.parse_args()
 

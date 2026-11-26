@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QApplication,
 )
 from PySide6 import QtGui, QtWidgets
-from PySide6.QtCore import Qt, QPoint
+from PySide6.QtCore import Qt, QPoint, QEvent
 
 from core import Ctx
 
@@ -108,6 +108,8 @@ class RegistersWidget(QtWidgets.QWidget):
             label_value.setFixedWidth(max_val_width)
             label_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
             label_value.setTextInteractionFlags(TextSelectableByMouse)
+            label_value.setToolTip("Double-click: show this address in the Memory window")
+            label_value.installEventFilter(self)
 
             label_value.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
@@ -138,6 +140,8 @@ class RegistersWidget(QtWidgets.QWidget):
     def show_context_menu(self, value_label: QLabel, pos: QPoint) -> None:
         menu = QMenu(self)
         copy_action = menu.addAction("Copy Value")
+        mem_action = menu.addAction("Show in Memory window")
+        mem_action.setEnabled(self._label_value(value_label) is not None)
 
         global_pos = value_label.mapToGlobal(pos)
         action = menu.exec(global_pos)
@@ -145,6 +149,26 @@ class RegistersWidget(QtWidgets.QWidget):
         if action == copy_action:
             clipboard = QApplication.clipboard()
             clipboard.setText(value_label.text())
+        elif action == mem_action:
+            self._show_in_memory(value_label)
+
+    @staticmethod
+    def _label_value(value_label: QLabel):
+        try:
+            return int(value_label.text(), 16)
+        except ValueError:
+            return None  # "<undefined>"
+
+    def _show_in_memory(self, value_label: QLabel) -> None:
+        value = self._label_value(value_label)
+        if value is not None:
+            self.ctx.goto_memory(value)
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.MouseButtonDblClick and obj in self.value_labels:
+            self._show_in_memory(obj)
+            return True
+        return super().eventFilter(obj, event)
 
     def on_time_edit(self) -> None:
         try:

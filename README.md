@@ -29,14 +29,15 @@ The new archictecture is based on four components :
 
 **Frontend**: 
 - Timeline / Register / Memory views.
+- Call tree view (from the `.calls.txt` call list), synchronized with the timeline.
+- Memory view follows the memory accesses of the current instruction; double-click a register to show it in memory.
 - Assembly timeline trails (red/green/blue).
 - Memory read/write breakpoint.
 - Jump to first/prev/next/last execution.
 
 ### Missing features & TODOs
 
-- Reach frontend feature parity with Frinet v1:
-  - The call tree view is not yet implemented.
+- Reach frontend feature parity with Frinet v1.
 - UI polishing.
   
 ## Build & Installation
@@ -61,7 +62,29 @@ python tracer/trace.py spawn /bin/ls ls 0x4c00
 cargo run --bin frinet --release -- index --format tenet tracer/traces/ls_xxxx.tenet ls.db
 
 # 3. Open the trace in IDA (File > Load File > Open Frinet DB...)
+
+# 4. Optional: open the call list (File > Load File > Open Frinet call tree...)
 ```
+
+### Call list
+
+Each trace gets a `<trace>.calls.txt` next to it (one line per call / API call / return,
+with the line number in the `.tenet` file):
+
+```
+line=127          call sub_14000E424   @14000E8BC
+line=185              api  KERNEL32!WriteFile   @14000E531
+line=201          ret  -> 14000E8C1
+```
+
+- By default the tracer records it while tracing (x64 fast mode), no copy of the binary needed.
+- `-X/--exe <binary>`: build it after tracing from the trace and a copy of the traced PE instead
+  (`tracer/calltree.py` can also be used standalone). `--nocalls` disables it.
+
+### Other tracer options
+
+- `child` subcommand: attach to a parent process and trace the child it starts (`-c/--child <exe name>`).
+- `-C/--cwd`: working directory for `spawn`.
 
 ## Testing & Fuzzing & Benchmark
 

@@ -34,7 +34,10 @@ class Db:
 
     _current_time: int
 
-    def __init__(self, path: str, arch: Arch):
+    def __init__(self, path: str, arch: Arch, image_base: int = 0):
+        # image_base: base of the module in the disassembler database, so trace
+        # addresses map to it without rebasing the database to 0
+        self.image_base = image_base
         self.frinet_db = frinet_db.open(path)
         self._metadata = self.frinet_db.metadata
 
@@ -54,12 +57,12 @@ class Db:
         slide = self._metadata.alsr_slide
         if slide is None:
             return None
-        return slide + ptr
+        return slide + ptr - self.image_base
 
     def unslide(self, ptr: int) -> int | None:
         slide = self._metadata.alsr_slide
         if slide is not None and ptr > slide:
-            return ptr - slide
+            return ptr - slide + self.image_base
         else:
             return None
 
@@ -114,7 +117,8 @@ class Ctx:
             self.close_db()
 
         try:
-            self._db = Db(path, self.arch)
+            get_base = getattr(self._decompiler, "image_base", None)
+            self._db = Db(path, self.arch, get_base() if get_base else 0)
         except Exception as e:
             print("Open DB failed :", e)
             return
@@ -132,6 +136,16 @@ class Ctx:
 
     def unregister_time_observer(self, observers: TimeObserver) -> None:
         self._time_observers.remove(observers)
+
+    def goto_memory(self, addr: int, size: int = 1) -> None:
+        """Show <addr> in the memory window(s)."""
+        for observer in list(self._time_observers):
+            goto = getattr(observer, "goto_address", None)
+            if goto is not None:
+                try:
+                    goto(addr, size)
+                except Exception as err:
+                    print(err)
 
     def search(self, query: str, is_regex: bool) -> None:
         try:
@@ -175,11 +189,20 @@ class Ctx:
 
         db._current_time = new_time
 
-        for observer in self._time_observers:
+        dead = []
+        for observer in list(self._time_observers):
             try:
                 observer.on_time_update()
+            except RuntimeError as err:
+                # window was closed by IDA: its Qt object is gone, forget it
+                if "already deleted" in str(err):
+                    dead.append(observer)
+                else:
+                    print(err)
             except Exception as err:
                 print(err)
+        for observer in dead:
+            self._time_observers.discard(observer)
 
         pc = db.pc_at(new_time)
         if pc is not None:
