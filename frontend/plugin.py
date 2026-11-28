@@ -22,6 +22,11 @@ from graph_widget import GraphWidget
 from story_widget import StoryWidget
 
 
+FRINET_MENU_ID = "frinet:menu"
+FRINET_MENU = "Frinet/"
+HELP_URL = "https://github.com/sigmantu1-design/frinet#readme"
+
+
 class IdaDecompiler(IDecompiler):
     _ctx: Ctx
 
@@ -109,6 +114,30 @@ class IdaDecompiler(IDecompiler):
         self._show_call_view(
             "Story - " + os.path.basename(model.path), widget, "IDA View-A", ida_kernwin.DP_TAB
         )
+
+    # "Show ..." menu items: bring back the window if it exists, else open it
+    def _activate(self, windows) -> bool:
+        for w in windows:
+            if w.visible:
+                widget = ida_kernwin.find_widget(w.title)
+                if widget is not None:
+                    ida_kernwin.activate_widget(widget, True)
+                return True
+        return False
+
+    def show_timeline(self):
+        for w in self.timeline_windows:
+            w.show()  # a toolbar: just make it visible again
+            return
+        self.open_timeline_window()
+
+    def show_registers(self):
+        if not self._activate(self.registers_windows):
+            self.open_registers_window()
+
+    def show_memory(self):
+        if not self._activate(self.memory_windows):
+            self.open_memory_window()
 
     def open_timeline_window(self):
         window = TimelineDock(self.ctx)
@@ -223,16 +252,20 @@ class DockableWindow(ida_kernwin.PluginForm):
 
 
 class IDACtxEntry(ida_kernwin.action_handler_t):
-    def __init__(self, action_function: Callable[[], None]):
+    def __init__(self, action_function: Callable[[], None], enabled: Optional[Callable[[], bool]] = None):
         super(IDACtxEntry, self).__init__()
         self.action_function = action_function
+        self.enabled = enabled
 
     def activate(self, ctx) -> int:
         self.action_function()
         return 1
 
     def update(self, ctx) -> int:
-        return ida_kernwin.AST_ENABLE_ALWAYS
+        if self.enabled is None:
+            return ida_kernwin.AST_ENABLE_ALWAYS
+        # AST_ENABLE / AST_DISABLE: IDA asks again whenever the context changes
+        return ida_kernwin.AST_ENABLE if self.enabled() else ida_kernwin.AST_DISABLE
 
 
 class Action:
@@ -247,20 +280,28 @@ class Action:
         callback: Callable[[], None],
         tooltip: str = "",
         shortcut: Optional[str] = None,
-        menu_path: Optional[str] = None,
+        menu_path=None,
+        enabled: Optional[Callable[[], bool]] = None,
     ):
         self.action_id = action_id
         self.label = label
         self.callback = callback
         self.tooltip = tooltip
         self.shortcut = shortcut
-        self.menu_path = menu_path
+        # one menu path, or a list of them (e.g. the Frinet menu and File/Load file)
+        if menu_path is None:
+            self.menu_paths = []
+        elif isinstance(menu_path, str):
+            self.menu_paths = [menu_path]
+        else:
+            self.menu_paths = list(menu_path)
+        self.enabled = enabled
 
     def register(self) -> bool:
         action_desc = ida_kernwin.action_desc_t(
             self.action_id,
             self.label,
-            IDACtxEntry(self.callback),
+            IDACtxEntry(self.callback, self.enabled),
             self.shortcut,
             self.tooltip,
             -1,
@@ -270,16 +311,12 @@ class Action:
             print(f"Failed to register action '{self.action_id}'")
             return False
 
-        if self.menu_path:
-            if not ida_kernwin.attach_action_to_menu(
-                self.menu_path, self.action_id, ida_kernwin.SETMENU_APP
-            ):
-                print(
-                    f"Failed to attach action '{self.action_id}' to menu '{self.menu_path}'"
-                )
-                return False
-
-        return True
+        ok = True
+        for path in self.menu_paths:
+            if not ida_kernwin.attach_action_to_menu(path, self.action_id, ida_kernwin.SETMENU_APP):
+                print(f"Failed to attach action '{self.action_id}' to menu '{path}'")
+                ok = False
+        return ok
 
     def attach_to_popup(self, widget, popup, popup_path) -> None:
         ida_kernwin.attach_action_to_popup(
@@ -312,69 +349,138 @@ class FrinetIDAPlugin(ida_idaapi.plugin_t):
         self.decompiler = IdaDecompiler()
         self.ctx = self.decompiler.ctx
 
-        # Define all actions cleanly in one place
+        # The Frinet menu, in the menu bar before Help
+        try:
+            ida_kernwin.create_menu(FRINET_MENU_ID, "Frinet", "Help")
+        except Exception as e:  # never block the plugin over the menu
+            print(f"[frinet] cannot create the Frinet menu: {e}")
+        M = FRINET_MENU
+        has_db = self.ctx.has_db
+
         self.open_db = Action(
             action_id="frinet:open_db",
             label="Open ~F~rinet DB...",
             callback=self.pick_and_open_db_file,
             tooltip="Open a Frinet DB (indexed trace)",
-            menu_path="File/Load file/",
+            menu_path=[M, "File/Load file/"],
+        )
+        self.close_db = Action(
+            action_id="frinet:close_db",
+            label="Close trace",
+            callback=self.ctx.close_db,
+            tooltip="Close the Frinet DB and its windows",
+            menu_path=M,
+            enabled=has_db,
         )
         self.open_calltree = Action(
             action_id="frinet:open_calltree",
             label="Open Frinet ~c~all tree...",
             callback=self.pick_and_open_calltree,
             tooltip="Open a .calls.txt call list as a navigable tree",
-            menu_path="File/Load file/",
+            menu_path=[M, "File/Load file/"],
         )
         self.open_graph = Action(
             action_id="frinet:open_graph",
             label="Open Frinet call ~g~raph...",
             callback=lambda: self.pick_calls_then(self.decompiler.open_graph_window),
             tooltip="Open a .calls.txt as a flame chart / call graph synchronized with the timeline",
-            menu_path="File/Load file/",
+            menu_path=M,
         )
         self.open_story = Action(
             action_id="frinet:open_story",
             label="Open Frinet ~s~tory...",
             callback=lambda: self.pick_calls_then(self.decompiler.open_story_window),
             tooltip="Open the narrative of a trace (from its .calls.txt), with links to points in time",
-            menu_path="File/Load file/",
+            menu_path=M,
         )
-        self.prev_exec = Action(
-            action_id="frinet:prev_execution",
-            label="Go to prev execution",
-            callback=self.goto_prev_exec,
-            tooltip="Go to the previous execution of the current address",
+        self.show_timeline = Action(
+            action_id="frinet:show_timeline",
+            label="Show Timeline",
+            callback=self.decompiler.show_timeline,
+            tooltip="Open the Timeline again (if you closed it)",
+            menu_path=M,
+            enabled=has_db,
         )
-        self.next_exec = Action(
-            action_id="frinet:next_execution",
-            label="Go to next execution",
-            callback=self.goto_next_exec,
-            tooltip="Go to the next execution of the current address",
+        self.show_registers = Action(
+            action_id="frinet:show_registers",
+            label="Show Registers",
+            callback=self.decompiler.show_registers,
+            tooltip="Open the Registers window again (if you closed it)",
+            menu_path=M,
+            enabled=has_db,
+        )
+        self.show_memory = Action(
+            action_id="frinet:show_memory",
+            label="Show Memory",
+            callback=self.decompiler.show_memory,
+            tooltip="Open the Memory window again (if you closed it)",
+            menu_path=M,
+            enabled=has_db,
+        )
+        self.search_memory = Action(
+            action_id="frinet:search_memory",
+            label="Search memory...",
+            callback=self.prompt_search_memory,
+            tooltip="Search the memory of the whole trace for text or a regular expression",
+            menu_path=M,
+            enabled=has_db,
         )
         self.first_exec = Action(
             action_id="frinet:first_execution",
             label="Go to first execution",
             callback=self.goto_first_exec,
             tooltip="Go to the first execution of the current address",
+            menu_path=M,
+            enabled=has_db,
+        )
+        self.prev_exec = Action(
+            action_id="frinet:prev_execution",
+            label="Go to prev execution",
+            callback=self.goto_prev_exec,
+            tooltip="Go to the previous execution of the current address",
+            menu_path=M,
+            enabled=has_db,
+        )
+        self.next_exec = Action(
+            action_id="frinet:next_execution",
+            label="Go to next execution",
+            callback=self.goto_next_exec,
+            tooltip="Go to the next execution of the current address",
+            menu_path=M,
+            enabled=has_db,
         )
         self.last_exec = Action(
             action_id="frinet:last_execution",
             label="Go to last execution",
             callback=self.goto_last_exec,
             tooltip="Go to the last execution of the current address",
+            menu_path=M,
+            enabled=has_db,
+        )
+        self.help = Action(
+            action_id="frinet:help",
+            label="Help (guide)...",
+            callback=lambda: ida_kernwin.open_url(HELP_URL),
+            tooltip="Open the Frinet for Windows guide in the browser",
+            menu_path=M,
         )
 
+        # menu order = registration order
         self.all_actions = [
             self.open_db,
+            self.close_db,
             self.open_calltree,
             self.open_graph,
             self.open_story,
+            self.show_timeline,
+            self.show_registers,
+            self.show_memory,
+            self.search_memory,
+            self.first_exec,
             self.prev_exec,
             self.next_exec,
-            self.first_exec,
             self.last_exec,
+            self.help,
         ]
 
         for action in self.all_actions:
@@ -425,6 +531,18 @@ class FrinetIDAPlugin(ida_idaapi.plugin_t):
             return
         self.ctx.open_db(path)
 
+    def prompt_search_memory(self) -> None:
+        if not self.ctx.has_db():
+            return
+        from memory_widget import SearchDialog
+        from PySide6.QtWidgets import QDialog
+
+        dialog = SearchDialog(None)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            text, is_regex = dialog.get_search_params()
+            if text:
+                self.ctx.search(text, is_regex)
+
     def pick_and_open_calltree(self) -> None:
         self.pick_calls_then(self.decompiler.open_calltree_window)
 
@@ -438,6 +556,10 @@ class FrinetIDAPlugin(ida_idaapi.plugin_t):
     def term(self) -> None:
         try:
             self.idb_hooks.unhook()
+        except Exception:
+            pass
+        try:
+            ida_kernwin.delete_menu(FRINET_MENU_ID)
         except Exception:
             pass
         print("frinet::term()")
