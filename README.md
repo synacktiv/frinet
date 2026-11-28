@@ -65,7 +65,7 @@ cargo run --bin frinet --release -- index --format tenet tracer/traces/ls_xxxx.t
 
 # 3. Open the trace in IDA (File > Load File > Open Frinet DB...)
 
-# 4. Optional: open the call list (Frinet menu > Open Frinet call tree / call graph / story...)
+# 4. Optional: open the call list (Edit > Plugins > Frinet > Open Frinet call tree / call graph / story...)
 ```
 
 ### Call list
