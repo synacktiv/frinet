@@ -29,7 +29,9 @@ The new archictecture is based on four components :
 
 **Frontend**: 
 - Timeline / Register / Memory views.
-- Call tree view (from the `.calls.txt` call list), synchronized with the timeline.
+- Call tree view (from the `.calls.txt` call list), synchronized with the timeline, with real IDA names or addresses.
+- Graph view: flame chart of calls over time and call graph, both synchronized with the timeline.
+- Story view: a generated narrative of the trace (API calls with decoded arguments) where every time and address is a link.
 - Memory view follows the memory accesses of the current instruction; double-click a register to show it in memory.
 - Assembly timeline trails (red/green/blue).
 - Memory read/write breakpoint.
@@ -63,7 +65,7 @@ cargo run --bin frinet --release -- index --format tenet tracer/traces/ls_xxxx.t
 
 # 3. Open the trace in IDA (File > Load File > Open Frinet DB...)
 
-# 4. Optional: open the call list (File > Load File > Open Frinet call tree...)
+# 4. Optional: open the call list (File > Load File > Open Frinet call tree / call graph / story...)
 ```
 
 ### Call list
