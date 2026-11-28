@@ -1,9 +1,3 @@
-target
-Cargo.lock
-*.tenet
-*.db
-*.i64
-perf.data*
+/target
 __pycache__
-frontend/*.so
-out
+/tracers/frida/traces

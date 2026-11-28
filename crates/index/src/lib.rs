@@ -1,154 +1,94 @@
 use core::mem;
 
-use frinet_db::flat::RTreeHeader;
-use frinet_db::memory::{MemReadSpec, MemWriteSpec};
-use frinet_db::register::RegSpec;
-use frinet_db::rtree::Spec;
+use frinet_db::format::{RTreeHeader, Section, StorageMut};
 use log::debug;
-use zerocopy::FromBytes;
 
 use crate::hilbert_spec::HilbertSpec;
-use crate::layout::{RTreeListViewMut, build_storage_layout, build_storage_view_mut};
-use crate::parser::{Pass, ProgressReporter, TraceParser};
-use crate::pass::{RTreeScout, fill_pass, hilbert_partition_pass, scout_pass};
-use crate::storage::DbStorage;
+use crate::parser::{Parser, ParserGenerator, Pass, ProgressReporter};
+use crate::pass::{fill_pass, hilbert_partition_pass, scout_pass};
+use crate::storage::StorageBackend;
 
 mod disjoint;
 mod hilbert_spec;
-mod layout;
 mod pass;
 
 pub mod parser;
 pub mod storage;
 
-pub fn build_index(
-    parser: &mut (impl TraceParser + Send),
+/// Builds the database into `backend`, `Ok(false)` once `progress` is cancelled
+pub fn build_index<Gen>(
+    parser_gen: &mut Gen,
     progress: &mut dyn ProgressReporter,
-    db_storage: &mut dyn DbStorage,
+    backend: &mut dyn StorageBackend,
     node_size_order: u8,
-) {
+) -> Result<bool, <Gen::Parser as Parser>::Err>
+where
+    Gen: ParserGenerator,
+{
     assert!(
         (1..=16).contains(&node_size_order),
         "node size order must be in 1..=16"
     );
 
     progress.start(Pass::Scout);
-    let scout = scout_pass(parser, progress, node_size_order);
+    let scout = scout_pass(parser_gen.generate()?, progress, node_size_order)?;
+    if progress.is_cancelled() {
+        return Ok(false);
+    }
+    let plan = &scout.plan;
 
-    debug!("Build storage layout");
-    let layout = build_storage_layout(&scout, node_size_order);
+    let storage_size = plan.storage_size();
+    debug!("Storage size : {storage_size}");
 
     progress.start(Pass::Partitions);
-    let partitions = hilbert_partition_pass(parser, progress, &scout);
-
-    /*let mut max_concurrent_leaves = 0;
-    for partition in &mem_partitions {
-        max_concurrent_leaves += partition.max_concurrent_leaves();
+    let partitions = hilbert_partition_pass(parser_gen.generate()?, progress, &scout)?;
+    if progress.is_cancelled() {
+        return Ok(false);
     }
-    debug!("Max concurrent leaves : {max_concurrent_leaves}");*/
 
-    // let _leaf_buffers_permit = limiter
-    //     .acquire_now(max_concurrent_leaves * flat::MemLeaf::SIZE)
-    //     .expect("Need more memory for concurrent leaves");
-
-    let storage = db_storage.allocate(layout.max_storage_size);
+    let mut storage = plan.init_storage(backend.allocate(storage_size));
 
     progress.start(Pass::Fill);
-    let fill = fill_pass(parser, progress, storage, &scout, &layout, &partitions);
-    let data_unused = scout.data_section_required_bytes - fill.data_used;
-
-    let mut sview = build_storage_view_mut(storage, &layout, &partitions);
-
-    *sview.header = layout.header;
-
-    sview
-        .metadata
-        .copy_from_slice(scout.metadata_json.as_bytes());
-
-    write_rtree_bboxes_and_levels(
-        &layout.write_zones,
-        &scout.write_zones,
-        &mut sview.write_zones,
-    );
-    write_rtree_bboxes_and_levels(&layout.read_zones, &scout.read_zones, &mut sview.read_zones);
-    write_rtree_bboxes_and_levels(&layout.registers, &scout.registers, &mut sview.registers);
+    let Some(fill) = fill_pass(parser_gen.generate()?, progress, &storage, &partitions)? else {
+        return Ok(false);
+    };
+    let data_unused = plan.data_bytes - fill.data_used;
 
     // truncate data section
-    sview.header.data.end -= data_unused as u64;
-    drop(sview);
+    storage.header_mut().data.item_len -= data_unused as u64;
 
-    compute_and_write_rtrees_nodes::<RegSpec>(
-        node_size_order,
-        storage,
-        &scout.registers,
-        &layout.registers,
-    );
-
-    compute_and_write_rtrees_nodes::<MemWriteSpec>(
-        node_size_order,
-        storage,
-        &scout.write_zones,
-        &layout.write_zones,
-    );
-
-    compute_and_write_rtrees_nodes::<MemReadSpec>(
-        node_size_order,
-        storage,
-        &scout.read_zones,
-        &layout.read_zones,
-    );
+    let header = *storage.header();
+    compute_and_write_rtrees_nodes(&storage, header.write_zones);
+    compute_and_write_rtrees_nodes(&storage, header.read_zones);
 
     // truncate unused trailing storage
-    db_storage.truncate(layout.max_storage_size - data_unused);
+    backend.truncate(storage_size - data_unused);
 
-    progress.finish();
+    Ok(true)
 }
 
 fn compute_and_write_rtrees_nodes<S: HilbertSpec>(
-    node_size_order: u8,
-    storage: &mut [u8],
-    rtrees: &[RTreeScout<S::Node>],
-    headers: &[RTreeHeader],
+    storage: &StorageMut<'_>,
+    rtrees: Section<RTreeHeader<S>>,
 ) {
-    for idx in 0..rtrees.len() {
-        let header = &headers[idx];
-        let bbox = &rtrees[idx].bbox;
+    // SAFETY: R-Tree headers and leaves are only read, nodes of each tree are borrowed once
+    unsafe {
+        for rtree in storage.slice(rtrees) {
+            let leaves = storage.slice(rtree.leaves);
+            let nodes = storage.slice_mut(rtree.nodes);
 
-        let leaves_range = header.leaves.byte_range();
-        let nodes_range = header.nodes.byte_range();
+            debug_assert!(
+                leaves.is_sorted_by_key(|leaf| S::hilbert_key(leaf, &rtree.bbox)),
+                "leaves must be sorted at this point"
+            );
 
-        let [leaves, nodes] = storage
-            .get_disjoint_mut([leaves_range, nodes_range])
-            .unwrap();
-
-        let leaves = <[S::Leaf]>::ref_from_bytes(leaves).unwrap();
-        let nodes = <[S::Node]>::mut_from_bytes(nodes).unwrap();
-
-        debug_assert!(
-            leaves.is_sorted_by_key(|leaf| S::hilbert_key(leaf, bbox)),
-            "memory : leaves must be sorted at this point"
-        );
-
-        build_intermediate_nodes_from_sorted_leaves::<S>(node_size_order, leaves, nodes);
-    }
-}
-
-fn write_rtree_bboxes_and_levels<S: Spec>(
-    headers: &[RTreeHeader],
-    rtrees: &[RTreeScout<S::Node>],
-    view: &mut RTreeListViewMut<'_, S>,
-) {
-    view.headers.copy_from_slice(&headers);
-    for idx in 0..headers.len() {
-        view.bboxes[idx] = rtrees[idx].bbox;
-
-        let levels = &mut view.rtrees[idx].levels;
-        levels.copy_from_slice(&rtrees[idx].levels);
+            build_intermediate_nodes_from_sorted_leaves::<S>(rtree.node_size_order, leaves, nodes);
+        }
     }
 }
 
 fn build_intermediate_nodes_from_sorted_leaves<S>(
-    node_size_order: u8,
+    node_size_order: u64,
     in_leaves: &[S::Leaf],
     out_nodes: &mut [S::Node],
 ) where

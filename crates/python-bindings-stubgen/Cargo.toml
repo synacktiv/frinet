@@ -1,7 +1,0 @@
-[package]
-name = "frinet-python-bindings-stubgen"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-pyo3-introspection = "0.28.3"

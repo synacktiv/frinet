@@ -4,11 +4,11 @@ use crate::rtree::*;
 
 impl<'storage, S: Spec> RTree<'storage, S> {
     /// Query using the specified strategy
-    pub fn query<'rtree, Q>(&'rtree self, query: Q) -> QueryIter<'rtree, 'storage, S, Q>
+    pub fn query<Q>(&self, query: Q) -> QueryIter<'storage, S, Q>
     where
         Q: Query<S>,
     {
-        QueryIter::new(self, query)
+        QueryIter::new(*self, query)
     }
 }
 
@@ -21,8 +21,8 @@ pub trait Query<S: Spec> {
 }
 
 /// A lazy traversal using a specific strategy
-pub struct QueryIter<'rtree, 'storage, S: Spec, Q> {
-    rtree: &'rtree RTree<'storage, S>,
+pub struct QueryIter<'storage, S: Spec, Q> {
+    rtree: RTree<'storage, S>,
     query: Q,
     level_iters: Vec<Enumerate<core::slice::Iter<'storage, S::Node>>>,
     leaf_iter: Option<core::slice::Iter<'storage, S::Leaf>>,
@@ -30,13 +30,13 @@ pub struct QueryIter<'rtree, 'storage, S: Spec, Q> {
     pos: usize,
 }
 
-impl<'rtree, 'storage, S, Q> QueryIter<'rtree, 'storage, S, Q>
+impl<'storage, S, Q> QueryIter<'storage, S, Q>
 where
     S: Spec,
     Q: Query<S>,
 {
     /// Build a new query
-    fn new(rtree: &'rtree RTree<'storage, S>, query: Q) -> Self {
+    fn new(rtree: RTree<'storage, S>, query: Q) -> Self {
         let mut level_iters = Vec::with_capacity(rtree.depth());
         let mut leaf_iter = None;
 
@@ -56,7 +56,7 @@ where
     }
 }
 
-impl<'rtree, 'storage, S, Q> Iterator for QueryIter<'rtree, 'storage, S, Q>
+impl<'storage, S, Q> Iterator for QueryIter<'storage, S, Q>
 where
     S: Spec,
     Q: Query<S>,
@@ -66,7 +66,7 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let node_size_order = self.rtree.node_size_order;
-            let node_size = 1 << node_size_order;
+            let node_size = self.rtree.node_size();
 
             if let Some(leaf_iter) = &mut self.leaf_iter {
                 match leaf_iter.next() {
@@ -109,7 +109,7 @@ where
                     let start = self.pos;
                     let max_end = start + node_size;
 
-                    if let Some(next_level_nodes) = self.rtree.node_levels.get(level + 1) {
+                    if let Some(next_level_nodes) = self.rtree.level_nodes(level + 1) {
                         // Push the next level iterator
                         let end = max_end.min(next_level_nodes.len());
 

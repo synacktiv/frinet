@@ -1,0 +1,72 @@
+# Runs on every PR and every push to main:
+# - fmt: code is formatted according to rustfmt
+# - doc: the docs build without warnings
+# - msrv: the workspace builds with the declared rust-version
+# - ida-plugin: the IDA plugin manifest passes the Hex-Rays linter
+# Adapted from https://github.com/jonhoo/rust-ci-conf
+permissions:
+  contents: read
+on:
+  push:
+    branches: [main]
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+name: check
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    name: stable / fmt
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # branch=master
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --check
+  doc:
+    runs-on: ubuntu-latest
+    name: stable / doc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # branch=master
+        with:
+          toolchain: stable
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps --all-features --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+  msrv:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        msrv: ["1.89"] # must match workspace.package.rust-version
+    name: ubuntu / ${{ matrix.msrv }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+      - name: Install ${{ matrix.msrv }}
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # branch=master
+        with:
+          toolchain: ${{ matrix.msrv }}
+      - name: cargo +${{ matrix.msrv }} check
+        run: cargo check --workspace --all-features --locked
+  ida-plugin:
+    runs-on: ubuntu-latest
+    name: ida-plugin / lint
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+      - name: Install uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # tag=v10.4.0
+      - name: hcli plugin lint
+        run: uvx --from ida-hcli hcli plugin lint frontend
+      - name: Versions match
+        run: |
+          plugin=$(jq -r .plugin.version frontend/ida-plugin.json)
+          python=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
+          crate=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "frinet-python") | .version')
+          echo "ida-plugin.json=$plugin pyproject.toml=$python frinet-python=$crate"
+          [ "$plugin" = "$python" ] && [ "$python" = "$crate" ]

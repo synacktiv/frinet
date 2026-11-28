@@ -1,9 +1,33 @@
 {
+    "$schema": "https://hcli.docs.hex-rays.com/schemas/ida-plugin.json",
     "IDAMetadataDescriptorVersion": 1,
     "plugin": {
         "name": "Frinet",
-        "version": "0.1.0",
-        "idaVersions": "9.3",
-        "entryPoint": "plugin.py"
+        "entryPoint": "plugin.py",
+        "version": "2.1.0",
+        "description": "Explore Frida execution traces in IDA: timeline, registers, memory, call tree and search across large traces.",
+        "license": "MIT",
+        "idaVersions": ">=9.0",
+        "requiresPython": ">=3.11",
+        "pythonDependencies": ["frinet>=2.1.0,<3"],
+        "categories": [
+            "debugging-and-tracing",
+            "vulnerability-research-and-exploit-development"
+        ],
+        "keywords": [
+            "frida",
+            "trace",
+            "tenet",
+            "time-travel-debugging",
+            "reverse-engineering"
+        ],
+        "authors": [
+            {
+                "name": "Wardenfar"
+            }
+        ],
+        "urls": {
+            "repository": "https://github.com/synacktiv/frinet"
+        }
     }
 }

@@ -141,10 +141,7 @@ impl Eq for MultiState {}
 
 impl PartialEq for MultiState {
     fn eq(&self, other: &Self) -> bool {
-        assert!(
-            self.0.is_sorted(),
-            "MultiState is not sorted on comparaison"
-        );
+        assert!(self.0.is_sorted(), "MultiState is not sorted on comparison");
         self.0 == other.0
     }
 }

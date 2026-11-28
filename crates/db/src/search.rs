@@ -1,6 +1,5 @@
 use std::{
     cmp::Ordering,
-    fmt::Debug,
     sync::mpsc::{self, Sender},
     thread,
 };
@@ -13,29 +12,76 @@ use rayon::{
     iter::{IntoParallelRefIterator, ParallelIterator},
     slice::ParallelSliceMut,
 };
-use regex_syntax::{ParserBuilder, hir::Hir};
+use regex_syntax::{
+    ParserBuilder,
+    hir::{Hir, HirKind},
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
-use zerocopy::IntoBytes;
 
 use crate::{
     db::Db,
-    flat::{Addr, MemWriteLeaf, Time},
+    format::{Addr, MemWriteLeaf, Time},
     irange::IRange,
     memory::MemWriteRTree,
+    task::Task,
 };
 
-/// Search byte sequence in Memory R-Tree
-pub fn search(db: &Db<'_>, needle: &[u8]) -> Vec<SearchResult> {
-    let hir = Hir::literal(needle.as_bytes());
-    search_hir(db, &hir)
+pub struct Pattern(Hir);
+
+#[derive(Debug)]
+pub enum PatternError {
+    Syntax(Box<regex_syntax::Error>),
+    Unsupported(&'static str),
 }
 
-/// Search regex pattern in Memory R-Tree
-pub fn search_regex(db: &Db<'_>, regex: &str) -> Result<Vec<SearchResult>, regex_syntax::Error> {
-    let mut parser = ParserBuilder::default().unicode(false).utf8(false).build();
-    let hir = parser.parse(regex)?;
-    Ok(search_hir(db, &hir))
+impl std::fmt::Display for PatternError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PatternError::Syntax(err) => write!(f, "{err}"),
+            PatternError::Unsupported(what) => write!(f, "{what} is not supported"),
+        }
+    }
+}
+
+impl std::error::Error for PatternError {}
+
+impl From<regex_syntax::Error> for PatternError {
+    fn from(err: regex_syntax::Error) -> Self {
+        PatternError::Syntax(Box::new(err))
+    }
+}
+
+impl Pattern {
+    pub fn literal(needle: &[u8]) -> Result<Self, PatternError> {
+        let hir = Hir::literal(needle);
+        check_supported(&hir)?;
+        Ok(Self(hir))
+    }
+
+    pub fn parse(regex: &str) -> Result<Self, PatternError> {
+        let mut parser = ParserBuilder::default().unicode(false).utf8(false).build();
+        let hir = parser.parse(regex)?;
+        check_supported(&hir)?;
+        Ok(Self(hir))
+    }
+}
+
+/// Rejects what [hir_to_nfa] panics on, before a search thread runs it
+fn check_supported(hir: &Hir) -> Result<(), PatternError> {
+    match hir.kind() {
+        HirKind::Empty => Err(PatternError::Unsupported("empty pattern")),
+        HirKind::Literal(lit) if lit.0.is_empty() => {
+            Err(PatternError::Unsupported("empty pattern"))
+        }
+        HirKind::Look(_) => Err(PatternError::Unsupported("look-around (`^`, `$`, `\\b`)")),
+        HirKind::Literal(_) | HirKind::Class(_) => Ok(()),
+        HirKind::Repetition(repetition) => check_supported(&repetition.sub),
+        HirKind::Capture(capture) => check_supported(&capture.sub),
+        HirKind::Concat(subs) | HirKind::Alternation(subs) => {
+            subs.iter().try_for_each(check_supported)
+        }
+    }
 }
 
 type TransitionTable = FxHashMap<(State, u8), State>;
@@ -88,8 +134,7 @@ struct ChainKey {
 }
 
 #[derive(PartialEq, Eq, Debug, Clone)]
-#[cfg_attr(feature = "pyo3", pyo3::pyclass(get_all, skip_from_py_object))]
-pub struct SearchResult {
+pub struct SearchMatch {
     pub addr_min: Addr,
     pub addr_max: Addr,
     pub time_min: Time,
@@ -127,7 +172,8 @@ impl Ord for ChainKey {
     }
 }
 
-fn search_hir(db: &Db<'_>, hir: &Hir) -> Vec<SearchResult> {
+/// Searches every memory snapshot, reporting its progress in leaves of the memory index
+pub fn search_pattern(db: &Db<'_>, Pattern(hir): &Pattern, task: &Task) -> Vec<SearchMatch> {
     debug!("Building NFA");
     let nfa = hir_to_nfa(hir);
 
@@ -142,7 +188,7 @@ fn search_hir(db: &Db<'_>, hir: &Hir) -> Vec<SearchResult> {
     );
 
     let initial_state: State = dfa.initial_state();
-    let non_special_states: Vec<State> = dfa.non_special_states().unique().collect();
+    let non_special_states: Vec<_> = dfa.non_special_states().unique().collect();
 
     if dfa.accept_states.contains(&initial_state) {
         error!("fully optional regex given (the initial state is an accepting state)");
@@ -173,19 +219,27 @@ fn search_hir(db: &Db<'_>, hir: &Hir) -> Vec<SearchResult> {
         }
     }
 
-    db.write_zones
-        .iter()
-        .flat_map(|zone| {
-            search_in_zone(
-                db,
-                zone,
-                &dfa,
-                initial_state,
-                &non_special_states,
-                &transition_table,
-            )
-        })
-        .collect()
+    let leaves = db.write_zones.iter().map(|zone| zone.leaves.len()).sum();
+    task.set_total(leaves);
+
+    let mut matches = Vec::new();
+    for zone in &db.write_zones {
+        if task.is_cancelled() {
+            break;
+        }
+
+        matches.extend(search_in_zone(
+            db,
+            zone,
+            &dfa,
+            initial_state,
+            &non_special_states,
+            &transition_table,
+            task,
+        ));
+    }
+
+    matches
 }
 
 fn search_in_zone(
@@ -195,7 +249,8 @@ fn search_in_zone(
     initial_state: State,
     non_special_states: &[State],
     transition_table: &TransitionTable,
-) -> Vec<SearchResult> {
+    task: &Task,
+) -> Vec<SearchMatch> {
     let mut chain_starts = Vec::new();
     let mut ordered_chains = Vec::new();
 
@@ -217,6 +272,10 @@ fn search_in_zone(
         });
 
         zone.leaves.par_iter().for_each(|leaf| {
+            if task.is_cancelled() {
+                return;
+            }
+
             let (chain_starts, chains) = partial_search(
                 leaf,
                 db.mem_leaf_data(leaf),
@@ -225,6 +284,8 @@ fn search_in_zone(
                 transition_table,
                 &dfa.accept_states,
             );
+
+            task.advance(1);
 
             if !chain_starts.is_empty() {
                 chain_starts_sender.send(chain_starts).unwrap();
@@ -235,13 +296,17 @@ fn search_in_zone(
         });
     });
 
+    if task.is_cancelled() {
+        return Vec::new();
+    }
+
     ordered_chains.par_sort_unstable_by_key(Chain::key);
 
     let (sender, receiver) = mpsc::channel();
     rayon::scope(|scope| {
         for chain in chain_starts {
             scope.spawn(|scope| {
-                chain_task(scope, chain, &ordered_chains, &sender);
+                chain_task(scope, chain, &ordered_chains, &sender, task);
             });
         }
     });
@@ -253,18 +318,22 @@ fn chain_task<'scope>(
     scope: &Scope<'scope>,
     mut half: ChainHalf,
     ordered_chains: &'scope [Chain],
-    result_sender: &'scope Sender<SearchResult>,
+    result_sender: &'scope Sender<SearchMatch>,
+    task: &'scope Task,
 ) {
     loop {
+        if task.is_cancelled() {
+            break;
+        }
         match half.to {
             Handle::Tip => {
-                let search_result = SearchResult {
+                let search_match = SearchMatch {
                     addr_min: half.addr_range.min,
                     addr_max: half.addr_range.max,
                     time_min: half.time_range.min,
                     time_max: half.time_range.max,
                 };
-                result_sender.send(search_result).unwrap();
+                result_sender.send(search_match).unwrap();
                 break;
             }
             Handle::State(state) => {
@@ -282,19 +351,12 @@ fn chain_task<'scope>(
                     time_start: Time::MAX,
                 };
 
-                let start_idx = match ordered_chains.binary_search_by_key(&start_key, Chain::key) {
-                    Ok(idx) => idx,
-                    Err(idx) => idx,
-                };
-
+                // the chains of this state and address, however many share a key
+                let start_idx = ordered_chains.partition_point(|chain| chain.key() < start_key);
                 let rest = &ordered_chains[start_idx..];
-                let end_idx = match rest.binary_search_by_key(&end_key, Chain::key) {
-                    Ok(idx) => start_idx + idx + 1,
-                    Err(idx) => start_idx + idx,
-                };
+                let end_idx = rest.partition_point(|chain| chain.key() <= end_key);
 
-                let chain_iter = &ordered_chains[start_idx..end_idx];
-                let mut chain_iter = chain_iter
+                let mut chain_iter = rest[..end_idx]
                     .iter()
                     .filter_map(|next| half.connect(&next.half));
 
@@ -306,7 +368,7 @@ fn chain_task<'scope>(
                 for next_chain in chain_iter {
                     // spawn another task on chain fork
                     scope.spawn(|scope| {
-                        chain_task(scope, next_chain, ordered_chains, result_sender);
+                        chain_task(scope, next_chain, ordered_chains, result_sender, task);
                     });
                 }
 
@@ -357,13 +419,13 @@ fn partial_search(
             }
         }
 
-        let start_addr = rect.node.addr_min + start_idx as Addr;
-        let match_addr = rect.node.addr_min + match_idx as Addr;
+        let start_addr = rect.node.addr.min + start_idx as Addr;
+        let match_addr = rect.node.addr.min + match_idx as Addr;
 
         chain_starts.push(ChainHalf {
             to: match_handle,
             addr_range: IRange::new(start_addr, match_addr),
-            time_range: rect.time_range(),
+            time_range: rect.node.time,
         });
     }
 
@@ -376,14 +438,14 @@ fn partial_search(
             continue;
         };
 
-        let match_addr = rect.node.addr_min + match_idx as Addr;
+        let match_addr = rect.node.addr.min + match_idx as Addr;
 
         chains.push(Chain {
             from: *state,
             half: ChainHalf {
                 to: match_handle,
-                addr_range: IRange::new(rect.node.addr_min, match_addr),
-                time_range: rect.time_range(),
+                addr_range: IRange::new(rect.node.addr.min, match_addr),
+                time_range: rect.node.time,
             },
         });
     }

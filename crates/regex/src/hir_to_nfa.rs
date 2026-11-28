@@ -5,8 +5,8 @@ use crate::*;
 /// Convert REGEX to NFA
 pub fn hir_to_nfa(hir: &Hir) -> Nfa<u8> {
     let mut nfa = Automata::new();
-    let mut counter = Counter::new(State::MIN);
-    let pair = rec_hir_to_nfa(hir, &mut counter, &mut nfa);
+    let counter = Counter::new(State::MIN);
+    let pair = rec_hir_to_nfa(hir, &counter, &mut nfa);
     nfa.initial_states.insert(pair.start);
     nfa.accept_states.insert(pair.end);
     nfa

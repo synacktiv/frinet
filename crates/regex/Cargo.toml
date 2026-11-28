@@ -1,12 +1,9 @@
 [package]
 name = "frinet-regex"
-version = "0.1.0"
+version = "2.1.0"
 edition = "2024"
+rust-version.workspace = true
 
 [dependencies]
 regex-syntax = { workspace = true }
-itertools = { workspace = true }
 rustc-hash = { workspace = true }
-
-[dev-dependencies]
-expect-test = { workspace = true }

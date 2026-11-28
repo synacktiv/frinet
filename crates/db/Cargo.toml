@@ -1,7 +1,13 @@
 [package]
 name = "frinet-db"
-version = "0.1.0"
+version = "2.1.0"
 edition = "2024"
+rust-version.workspace = true
+
+[package.metadata.deb]
+name = "custom-frinet"
+section = "net"
+assets = ["$auto"]
 
 [[bench]]
 name = "requests"
@@ -11,7 +17,6 @@ harness = false
 frinet-regex = { workspace = true }
 
 smallvec = { workspace = true }
-zerocopy = { workspace = true, features = ["derive"] }
 log = { workspace = true }
 rayon = { workspace = true }
 itertools = { workspace = true }
@@ -22,7 +27,6 @@ rustc-hash = { workspace = true }
 
 # optional deps
 arbitrary = { workspace = true, features = ["derive"], optional = true }
-pyo3 = { workspace = true, optional = true }
 
 [dev-dependencies]
 memmap2 = { workspace = true }

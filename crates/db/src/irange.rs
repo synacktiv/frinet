@@ -2,22 +2,23 @@ use core::fmt;
 use std::ops::{Add, Sub};
 
 /// Inclusive Range
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct IRange<S> {
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(C)]
+pub struct IRange<T> {
     /// Inclusive minimum value
-    pub min: S,
+    pub min: T,
     /// Inclusive maximum value
-    pub max: S,
+    pub max: T,
 }
 
 #[cfg(feature = "arbitrary")]
-impl<'a, S> arbitrary::Arbitrary<'a> for IRange<S>
+impl<'a, T> arbitrary::Arbitrary<'a> for IRange<T>
 where
-    S: arbitrary::Arbitrary<'a> + Ord + Copy,
+    T: arbitrary::Arbitrary<'a> + Ord + Copy,
 {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        let a: S = u.arbitrary()?;
-        let b: S = u.arbitrary()?;
+        let a: T = u.arbitrary()?;
+        let b: T = u.arbitrary()?;
 
         let min = core::cmp::min(a, b);
         let max = core::cmp::max(a, b);
@@ -26,40 +27,32 @@ where
     }
 }
 
-impl<S: Scalar> IRange<S> {
+impl<T: Unsigned> IRange<T> {
     /// Create range with inclusive start and end
-    pub fn new(min: S, max: S) -> Self {
+    pub fn new(min: T, max: T) -> Self {
         debug_assert!(min <= max);
         Self { min, max }
     }
 
-    /// Build a range spanning over the entier value space
-    pub fn full() -> Self {
-        Self {
-            min: S::ZERO,
-            max: S::MAX,
-        }
-    }
-
     /// Build a range over only one value
-    pub fn one(value: S) -> Self {
+    pub fn one(value: T) -> Self {
         Self {
             min: value,
             max: value,
         }
     }
 
-    pub fn min_distance(&self, value: S) -> S {
+    pub fn min_distance(&self, value: T) -> T {
         if value < self.min {
             self.min - value
         } else if self.max < value {
             value - self.max
         } else {
-            S::ZERO
+            T::ZERO
         }
     }
 
-    pub fn contains(&self, value: S) -> bool {
+    pub fn contains(&self, value: T) -> bool {
         self.min <= value && value <= self.max
     }
 
@@ -86,7 +79,7 @@ impl<S: Scalar> IRange<S> {
     }
 
     #[inline]
-    pub fn is_disjoint(&self, other: &Self) -> bool {
+    pub fn is_disjoint(self, other: Self) -> bool {
         #[cfg(debug_assertions)]
         {
             self.check_invariant();
@@ -99,19 +92,12 @@ impl<S: Scalar> IRange<S> {
     }
 
     /// Create range with (start, length)
-    pub fn from_start_len(start: S, len: S) -> Self {
-        assert!(len > S::ZERO);
+    pub fn from_start_len(start: T, len: T) -> Self {
+        assert!(len > T::ZERO);
         let min = start;
-        let max = start + (len - S::ONE);
+        let max = start + (len - T::ONE);
 
         Self { min, max }
-    }
-
-    /// Number of unique values included in this range
-    pub fn span(&self) -> S {
-        (self.max - self.min)
-            .checked_add(S::ONE)
-            .expect("span value is not representable")
     }
 
     /// Number of unique values included in this range
@@ -161,32 +147,22 @@ where
     }
 }
 
-pub trait Scalar: Copy + Ord + Add<Output = Self> + Sub<Output = Self> {
+/// Abstraction over unsigned integers
+pub trait Unsigned: Copy + Ord + Add<Output = Self> + Sub<Output = Self> {
     const ZERO: Self;
     const ONE: Self;
-    const MAX: Self;
-    const BITS: u32;
 
     fn checked_ilog2(self) -> Option<u32>;
 
     /// Panic if the value is too big to fit in usize
     fn into_usize(self) -> usize;
-
-    /// Checked add
-    fn checked_add(self, other: Self) -> Option<Self>;
 }
 
-macro_rules! impl_scalar_for_std_unsigned {
+macro_rules! impl_unsigned {
     ($ty:ty) => {
-        impl Scalar for $ty {
+        impl Unsigned for $ty {
             const ZERO: Self = 0;
             const ONE: Self = 1;
-            const MAX: Self = Self::MAX;
-            const BITS: u32 = Self::BITS;
-
-            fn checked_add(self, other: Self) -> Option<Self> {
-                <$ty>::checked_add(self, other)
-            }
 
             fn checked_ilog2(self) -> Option<u32> {
                 <$ty>::checked_ilog2(self)
@@ -199,8 +175,5 @@ macro_rules! impl_scalar_for_std_unsigned {
     };
 }
 
-impl_scalar_for_std_unsigned!(u8);
-impl_scalar_for_std_unsigned!(u16);
-impl_scalar_for_std_unsigned!(u32);
-impl_scalar_for_std_unsigned!(u64);
-impl_scalar_for_std_unsigned!(u128);
+impl_unsigned!(u32);
+impl_unsigned!(u64);

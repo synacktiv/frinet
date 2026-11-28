@@ -3,6 +3,7 @@ name = "frinet-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
+rust-version.workspace = true
 
 [package.metadata]
 cargo-fuzz = true
@@ -14,8 +15,22 @@ frinet-index = { workspace = true }
 arbitrary = { workspace = true, features = ["derive"] }
 
 [[bin]]
-name = "register_indexing"
-path = "fuzz_targets/register_indexing.rs"
+name = "register"
+path = "fuzz_targets/register.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "memory_writes"
+path = "fuzz_targets/memory_writes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "search"
+path = "fuzz_targets/search.rs"
 test = false
 doc = false
 bench = false

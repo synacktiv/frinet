@@ -1,99 +1,87 @@
-use std::fmt::Display;
-use std::ops::{Deref, IndexMut};
-
-use log::error;
 use serde::{Deserialize, Serialize};
-use zerocopy::{FromBytes, IntoBytes, KnownLayout};
 
+use crate::format::*;
 use crate::irange::IRange;
 use crate::memory::{MemReadSpec, MemWriteSpec};
+use crate::module_timeline::{ModuleId, find_module_by_addr};
 
 use crate::query::{Query, QueryIter};
-use crate::register::RegSpec;
+use crate::register::{INTERNAL_REGISTERS, Register, read_registers};
 use crate::rtree::{RTree, Spec};
-use crate::{DB_MAGIC, DB_VERSION, flat::*};
+use crate::scalar::ScalarSize;
+
+pub use crate::format::LoadError;
 
 /// Indexed database of an execution trace
 pub struct Db<'s> {
+    pub metadata: Metadata,
     pub write_zones: Vec<RTree<'s, MemWriteSpec>>,
     pub read_zones: Vec<RTree<'s, MemReadSpec>>,
-    pub registers: Vec<RTree<'s, RegSpec>>,
-    pub metadata: Metadata,
+    pub registers: Vec<Register<'s>>,
     pub raw_data: &'s [u8],
 }
 
+/// Data that are not worth laying out for being zerocopiable
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "pyo3", pyo3::pyclass(get_all, skip_from_py_object))]
 pub struct Metadata {
-    pub alsr_slide: Option<Addr>,
-    pub register_names: Vec<String>,
+    pub registers: Vec<RegisterInfo>,
+    pub modules: Vec<ModuleInfo>,
+    pub time_end: Time,
 }
 
-#[derive(Debug)]
-pub enum LoadError {
-    InvalidMagic,
-    InvalidVersion { got: u64, expected: u64 },
-    Corrupted,
+/// Metadata about a register declared in the trace header
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterInfo {
+    pub name: String,
+    pub scalar_size: ScalarSize,
 }
 
-impl Display for LoadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LoadError::InvalidMagic => f.write_str("invalid magic"),
-            LoadError::InvalidVersion { got, expected } => write!(
-                f,
-                "unexpected version number, got:{got} expected:{expected}"
-            ),
-            LoadError::Corrupted => f.write_str("database is corrupted"),
-        }
-    }
+/// Metadata about a module declared in the trace header
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleInfo {
+    pub name: String,
+    pub start: Addr,
+    pub end: Addr,
 }
 
-impl<Src, Dst> From<zerocopy::SizeError<Src, Dst>> for LoadError
-where
-    Src: Deref,
-    Dst: ?Sized + KnownLayout,
-{
-    fn from(err: zerocopy::SizeError<Src, Dst>) -> Self {
-        error!("Indexed DB is corrupted : {err}");
-        LoadError::Corrupted
-    }
-}
-
-impl<Src, Dst> From<zerocopy::CastError<Src, Dst>> for LoadError
-where
-    Src: Deref,
-    Dst: ?Sized + KnownLayout,
-{
-    fn from(err: zerocopy::CastError<Src, Dst>) -> Self {
-        error!("Indexed DB is corrupted : {err}");
-        LoadError::Corrupted
+impl ModuleInfo {
+    pub fn contains(&self, addr: Addr) -> bool {
+        self.start <= addr && addr < self.end
     }
 }
 
 impl<'s> Db<'s> {
-    pub fn from_aligned_slice(storage: &'s [u8]) -> Result<Self, LoadError> {
-        let header = Header::read_from_prefix(storage)?.0;
+    pub fn from_aligned_slice(bytes: &'s [u8]) -> Result<Self, LoadError> {
+        let storage = Storage::new(bytes);
+        let header = storage.header()?;
 
-        if header.magic != DB_MAGIC {
+        if header.magic[..4] != DB_MAGIC[..4] {
             return Err(LoadError::InvalidMagic);
         }
 
-        if header.version != DB_VERSION {
+        if header.magic != DB_MAGIC {
             return Err(LoadError::InvalidVersion {
-                got: header.version,
-                expected: DB_VERSION,
+                got: header.magic,
+                expected: DB_MAGIC,
             });
         }
 
-        let raw_data = cast_section::<u8>(storage, header.data)?;
+        let raw_data = storage.slice(header.data);
 
-        let metadata_json = cast_section::<u8>(storage, header.metadata)?;
-        let metadata: Metadata = serde_json::from_slice(metadata_json).unwrap();
+        let metadata_json = storage.slice(header.metadata);
+        let metadata: Metadata = serde_json::from_slice(metadata_json)
+            .unwrap_or_else(|err| panic!("invalid metadata: {err}"));
 
-        let write_zones = read_rtree_list(storage, &header.write_zones)?;
-        let read_zones = read_rtree_list(storage, &header.read_zones)?;
-        let registers = read_rtree_list(storage, &header.registers)?;
+        let write_zones = read_rtrees(storage, header.write_zones);
+        let read_zones = read_rtrees(storage, header.read_zones);
+
+        let registers =
+            read_registers(storage, header.registers_by_time, header.registers_by_value);
+
+        assert_eq!(
+            registers.len(),
+            INTERNAL_REGISTERS.len() + metadata.registers.len()
+        );
 
         Ok(Self {
             write_zones,
@@ -104,263 +92,124 @@ impl<'s> Db<'s> {
         })
     }
 
-    pub fn mem_write_query<'this, Q>(
-        &'this self,
-        query: Q,
-    ) -> MultiQueryIter<'this, 's, MemWriteSpec, Q>
+    pub fn module_at(&self, addr: Addr) -> Option<ModuleId> {
+        find_module_by_addr(&self.metadata.modules, addr)
+    }
+
+    pub fn mem_write_query<Q>(&self, query: Q) -> MultiQueryIter<'s, MemWriteSpec, Q>
     where
         Q: Query<MemWriteSpec> + Clone,
     {
         MultiQueryIter::new(query, &self.write_zones)
     }
 
-    pub fn mem_read_query<'this, Q>(
-        &'this self,
-        query: Q,
-    ) -> MultiQueryIter<'this, 's, MemReadSpec, Q>
+    pub fn mem_read_query<Q>(&self, query: Q) -> MultiQueryIter<'s, MemReadSpec, Q>
     where
         Q: Query<MemReadSpec> + Clone,
     {
         MultiQueryIter::new(query, &self.read_zones)
     }
 
-    pub fn mem_write_intersects<'this>(
-        &'this self,
+    pub fn mem_write_intersects(
+        &self,
         node: MemNode,
-    ) -> MultiQueryIter<'this, 's, MemWriteSpec, MemIntersects> {
+    ) -> MultiQueryIter<'s, MemWriteSpec, MemIntersects> {
         self.mem_write_query(MemIntersects { node })
     }
 
-    pub fn mem_read_intersects<'this>(
-        &'this self,
+    pub fn mem_read_intersects(
+        &self,
         node: MemNode,
-    ) -> MultiQueryIter<'this, 's, MemReadSpec, MemIntersects> {
+    ) -> MultiQueryIter<'s, MemReadSpec, MemIntersects> {
         self.mem_read_query(MemIntersects { node })
     }
 
-    pub fn fetch_at<BA, BS>(&self, addr_range: IRange<Addr>, time: Time) -> Fetch<Time, BA>
-    where
-        BS: ByteStorage,
-        BA: ByteArray<BS>,
-    {
-        let total_size = addr_range.span_usize();
+    /// Memory content of `addr_range` at `time`, the bytes the trace does not know read as zero
+    pub fn read_memory(&self, addr_range: IRange<Addr>, time: Time) -> Vec<u8> {
+        self.read_memory_with_unknowns(addr_range, time)
+            .into_iter()
+            .map(Option::unwrap_or_default)
+            .collect()
+    }
+
+    /// Memory content of `addr_range` at `time`, [None] for the bytes the trace does not know
+    pub fn read_memory_with_unknowns(
+        &self,
+        addr_range: IRange<Addr>,
+        time: Time,
+    ) -> Vec<Option<u8>> {
+        // no leaf reaches past the end of the trace, where nothing is known anymore
+        let time = time.min(self.metadata.time_end);
 
         let query_rect = MemNode {
-            addr_min: addr_range.min,
-            addr_max: addr_range.max,
-            time_min: time,
-            time_max: time,
+            addr: addr_range,
+            time: IRange::one(time),
         };
 
-        let mut array = BA::new(total_size);
-        let mut time_start = 0;
-        let mut time_end = Time::MAX;
-
-        let mut fill_count = 0;
+        let mut content = vec![None; addr_range.span_usize()];
 
         for leaf in self.mem_write_intersects(query_rect) {
-            let data = self.mem_leaf_data(leaf);
+            let overlap = leaf
+                .node
+                .addr
+                .intersection(&addr_range)
+                .expect("the leaf intersects the query");
 
-            let node_off;
-            let out_off;
+            let out_off = (overlap.min - addr_range.min) as usize;
+            let node_off = (overlap.min - leaf.node.addr.min) as usize;
+            let size = overlap.span_usize();
 
-            time_start = time_start.max(leaf.node.time_min);
-            time_end = time_end.min(leaf.node.time_max);
-
-            if leaf.node.addr_min < query_rect.addr_min {
-                out_off = 0;
-                node_off = (query_rect.addr_min - leaf.node.addr_min) as usize;
-            } else {
-                out_off = (leaf.node.addr_min - query_rect.addr_min) as usize;
-                node_off = 0;
-            }
-
-            let size = array[out_off..].len().min(data[node_off..].len());
-
-            for idx in 0..size {
-                array[out_off + idx] = BS::from_byte(data[node_off + idx]);
-                fill_count += 1;
+            let leaf_data = &self.mem_leaf_data(leaf)[node_off..][..size];
+            for (out, byte) in content[out_off..][..size].iter_mut().zip(leaf_data) {
+                *out = Some(*byte);
             }
         }
 
-        debug_assert!(fill_count <= total_size);
-        let is_complete = fill_count == total_size;
-
-        Fetch {
-            array,
-            is_complete,
-            valid_time_range: IRange::new(time_start, time_end),
-        }
+        content
     }
 
     pub fn mem_leaf_data(&self, leaf: &'s MemWriteLeaf) -> &'s [u8] {
-        let len = leaf.addr_range().span_usize();
+        let len = leaf.node.addr.span_usize();
         if len <= 8 {
             // NOTE: not portable but endianness will be checked in index header
-            &leaf.packed_data.as_bytes()[..len]
+            &bytes_of(&leaf.data)[..len]
         } else {
-            let offset = leaf.packed_data as usize;
+            let offset = leaf.data as usize;
             &self.raw_data[offset..][..len]
         }
     }
-
-    /* pub fn register_prev_next_in_value_range_at(
-        &self,
-        id: RegId,
-        value_range: IRange<u64>,
-        time: Time,
-    ) -> (Option<RegLeaf>, Option<RegLeaf>) {
-        let rtree = &self.registers[id.index()];
-
-        let prev_range = IRange::new(0, time.saturating_sub(1));
-        let next_range = IRange::new(time.saturating_add(1), Time::MAX);
-
-        let prev = walk_first(
-            rtree,
-            |node| {
-                if node.time_range().is_disjoint(&prev_range) {
-                    return NodeControlFlow::Ignore;
-                }
-                if node.value_range().is_disjoint(&value_range) {
-                    return NodeControlFlow::Ignore;
-                }
-                let dist = node.time_range().min_distance(time);
-                NodeControlFlow::Enter(dist)
-            },
-            |leaf| {
-                if leaf.time_range().is_disjoint(&prev_range) {
-                    return LeafControlFlow::Ignore;
-                }
-                if leaf.time_range().contains(time) {
-                    return LeafControlFlow::Ignore;
-                }
-                if !value_range.contains(leaf.value) {
-                    return LeafControlFlow::Ignore;
-                }
-
-                let dist = leaf.time_range().min_distance(time);
-                LeafControlFlow::Accept(dist)
-            },
-        );
-
-        let next = walk_first(
-            rtree,
-            |node| {
-                if node.time_range().is_disjoint(&next_range) {
-                    return NodeControlFlow::Ignore;
-                }
-                if node.value_range().is_disjoint(&value_range) {
-                    return NodeControlFlow::Ignore;
-                }
-                let dist = node.time_range().min_distance(time);
-                NodeControlFlow::Enter(dist)
-            },
-            |leaf| {
-                if leaf.time_range().is_disjoint(&next_range) {
-                    return LeafControlFlow::Ignore;
-                }
-                if leaf.time_range().contains(time) {
-                    return LeafControlFlow::Ignore;
-                }
-                if !value_range.contains(leaf.value) {
-                    return LeafControlFlow::Ignore;
-                }
-
-                let dist = leaf.time_range().min_distance(time);
-                LeafControlFlow::Accept(dist)
-            },
-        );
-
-        (prev.copied(), next.copied())
-    }*/
 }
 
-fn read_rtree_list<'s, S: Spec>(
-    storage: &'s [u8],
-    list: &RTreeList,
-) -> Result<Vec<RTree<'s, S>>, LoadError> {
-    let headers = cast_section::<RTreeHeader>(storage, list.headers)?;
-    let bboxes = cast_section::<S::Node>(storage, list.bboxes)?;
-
-    if headers.len() != bboxes.len() {
-        error!(
-            "RTreeHeader.len() != bboxes.len() : {} != {}",
-            headers.len(),
-            bboxes.len()
-        );
-        return Err(LoadError::Corrupted);
-    }
-
-    let count = headers.len();
-
-    let mut rtrees = Vec::with_capacity(count);
-    for idx in 0..count {
-        let header = headers[idx];
-        let bbox = bboxes[idx];
-
-        let node_size_order = header.node_size_order;
-
-        let Some(leaves_data) = storage.get(header.leaves.byte_range()) else {
-            error!("header.leaves out-of-bounds");
-            return Err(LoadError::Corrupted);
-        };
-        let leaves = <[S::Leaf]>::ref_from_bytes(leaves_data)?;
-
-        let Some(nodes_data) = storage.get(header.nodes.byte_range()) else {
-            error!("header.nodes out-of-bounds");
-            return Err(LoadError::Corrupted);
-        };
-        let nodes = <[S::Node]>::ref_from_bytes(nodes_data)?;
-
-        let Some(levels_data) = storage.get(header.levels.byte_range()) else {
-            error!("header.levels out-of-bounds");
-            return Err(LoadError::Corrupted);
-        };
-        let levels = <[Level]>::ref_from_bytes(levels_data)?;
-
-        let mut node_levels = Vec::with_capacity(levels.len());
-        for level in levels {
-            let Some(subset) = nodes.get((level.offset as usize)..) else {
-                error!("level.offset out-of-bounds");
-                return Err(LoadError::Corrupted);
-            };
-            let Some(subset) = subset.get(..(level.size as usize)) else {
-                error!("level.size out-of-bounds");
-                return Err(LoadError::Corrupted);
-            };
-            node_levels.push(subset)
-        }
-
+fn read_rtrees<'s, S: Spec>(
+    storage: Storage<'s>,
+    section: Section<RTreeHeader<S>>,
+) -> Vec<RTree<'s, S>> {
+    let mut rtrees = Vec::with_capacity(section.len());
+    for header in storage.slice(section) {
+        let node_size_order = u32::try_from(header.node_size_order)
+            .expect("node size order is not representable as a u32");
         rtrees.push(RTree {
             node_size_order,
-            leaves,
-            nodes,
-            node_levels,
-            bbox,
+            leaves: storage.slice(header.leaves),
+            nodes: storage.slice(header.nodes),
+            levels: storage.slice(header.levels),
+            bbox: header.bbox,
         });
     }
 
-    Ok(rtrees)
+    rtrees
 }
 
-fn cast_section<T>(data: &[u8], section: Section) -> Result<&[T], LoadError>
-where
-    T: Zerocopyable,
-{
-    let bytes = &data[section.byte_range()];
-    Ok(<[T]>::ref_from_bytes(bytes)?)
+pub struct MultiQueryIter<'storage, S: Spec, Q> {
+    zones: Vec<QueryIter<'storage, S, Q>>,
 }
 
-pub struct MultiQueryIter<'rtree, 'storage, S: Spec, Q> {
-    zones: Vec<QueryIter<'rtree, 'storage, S, Q>>,
-}
-
-impl<'rtree, 'storage, S: Spec, Q> MultiQueryIter<'rtree, 'storage, S, Q>
+impl<'storage, S: Spec, Q> MultiQueryIter<'storage, S, Q>
 where
     S: Spec,
     Q: Query<S> + Clone,
 {
-    pub fn new(query: Q, rtrees: &'rtree [RTree<'storage, S>]) -> Self {
+    pub fn new(query: Q, rtrees: &[RTree<'storage, S>]) -> Self {
         let zones = rtrees
             .iter()
             .filter(|zone| query.clone().filter_node(&zone.bbox))
@@ -370,7 +219,7 @@ where
     }
 }
 
-impl<'rtree, 'storage, S: Spec, Q> Iterator for MultiQueryIter<'rtree, 'storage, S, Q>
+impl<'storage, S: Spec, Q> Iterator for MultiQueryIter<'storage, S, Q>
 where
     Q: Query<S>,
 {
@@ -411,75 +260,5 @@ impl Query<MemReadSpec> for MemIntersects {
     }
     fn filter_leaf(&mut self, leaf: &MemReadLeaf) -> bool {
         !self.node.is_disjoint(&leaf.node())
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct RegIntersects {
-    node: RegNode,
-}
-
-impl RegIntersects {
-    pub fn new(node: RegNode) -> Self {
-        Self { node }
-    }
-}
-
-impl Query<RegSpec> for RegIntersects {
-    fn filter_node(&mut self, node: &RegNode) -> bool {
-        !self.node.is_disjoint(node)
-    }
-
-    fn filter_leaf(&mut self, leaf: &RegLeaf) -> bool {
-        self.filter_node(&leaf.node())
-    }
-}
-
-/// Memory fetch result
-pub struct Fetch<Time, BA> {
-    /// This time range span between the previous and the next memory update affecting the requested address range
-    pub valid_time_range: IRange<Time>,
-
-    /// Loaded data
-    pub array: BA,
-
-    /// False if at least one address has no value
-    pub is_complete: bool,
-}
-
-pub trait ByteArray<S: ByteStorage>
-where
-    Self: IndexMut<usize, Output = S>,
-    Self: IndexMut<core::ops::RangeFrom<usize>, Output = [S]>,
-{
-    fn new(size: usize) -> Self;
-}
-
-impl<S: ByteStorage> ByteArray<S> for Vec<S> {
-    fn new(size: usize) -> Self {
-        vec![S::default(); size]
-    }
-}
-
-impl<const LEN: usize, S: ByteStorage> ByteArray<S> for [S; LEN] {
-    fn new(size: usize) -> Self {
-        assert_eq!(LEN, size);
-        [S::default(); LEN]
-    }
-}
-
-pub trait ByteStorage: Default + Copy + Clone {
-    fn from_byte(v: u8) -> Self;
-}
-
-impl ByteStorage for u8 {
-    fn from_byte(v: u8) -> Self {
-        v
-    }
-}
-
-impl ByteStorage for Option<u8> {
-    fn from_byte(v: u8) -> Self {
-        Some(v)
     }
 }

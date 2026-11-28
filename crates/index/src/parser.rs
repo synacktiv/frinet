@@ -1,40 +1,48 @@
-use frinet_db::flat::{Addr, Time};
+use std::convert::Infallible;
 
-mod tenet;
-pub use tenet::*;
+use frinet_db::db::{ModuleInfo, RegisterInfo};
+use frinet_db::format::{Addr, Time};
+use frinet_db::scalar::Scalar;
 
-pub trait TraceParser {
-    fn parse<EmitFn>(&mut self, progress: &mut dyn ProgressReporter, emit: EmitFn)
+mod file;
+pub use file::*;
+
+/// Trace metadata, known before parsing events
+#[derive(Debug, Clone, Default)]
+pub struct TraceHeader {
+    pub registers: Vec<RegisterInfo>,
+    pub modules: Vec<ModuleInfo>,
+}
+
+pub trait ParserGenerator {
+    type Parser: Parser;
+
+    fn generate(&mut self) -> Result<Self::Parser, <Self::Parser as Parser>::Err>;
+}
+
+pub trait Parser {
+    type Err;
+
+    fn header(&self) -> &TraceHeader;
+    fn parse<'trace, EmitFn>(
+        &'trace self,
+        progress: &mut dyn ProgressReporter,
+        emit: EmitFn,
+    ) -> Result<(), Self::Err>
     where
-        EmitFn: FnMut(RawEvent);
+        EmitFn: FnMut(RawEvent<'trace>);
 }
 
-impl ProgressReporter for () {
-    fn report(&mut self, _: Progress) {}
-}
+impl ProgressReporter for () {}
 
+/// Follows the passes over the trace, a parser stops early once it is cancelled
 pub trait ProgressReporter: Send {
-    fn report(&mut self, progress: Progress);
-    fn start(&mut self, pass: Pass) {
-        self.report(Progress::Start(pass));
+    fn start(&mut self, _pass: Pass) {}
+    fn total(&mut self, _total: usize) {}
+    fn current(&mut self, _current: usize) {}
+    fn is_cancelled(&self) -> bool {
+        false
     }
-    fn total(&mut self, total: usize) {
-        self.report(Progress::Total(total));
-    }
-    fn current(&mut self, current: usize) {
-        self.report(Progress::Current(current));
-    }
-    fn finish(&mut self) {
-        self.report(Progress::Finish);
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Progress {
-    Start(Pass),
-    Finish,
-    Total(usize),
-    Current(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,52 +52,73 @@ pub enum Pass {
     Fill,
 }
 
-/// Raw (unprocessed) from the trace parser
-#[derive(Debug, Clone, Copy)]
-pub enum RawEvent<'a> {
-    AslrSlide(Addr),
-    TimedEvent {
-        time: Time,
-        event: TimedRawEvent<'a>,
-    },
+/// Raw (unprocessed) event from the trace parser
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawEvent<'trace> {
+    pub time: Time,
+    pub event: TimedRawEvent<'trace>,
 }
 
 /// Timed raw (unprocessed) event from the trace parser
-#[derive(Debug, Clone, Copy)]
-pub enum TimedRawEvent<'a> {
-    /// A memory event
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimedRawEvent<'trace> {
     Memory {
-        /// Base address
         addr: Addr,
-        bytes: &'a [u8],
+        bytes: &'trace [u8],
         mode: MemoryMode,
     },
-    /// A register update event
-    Register { name: &'a str, value: u64 },
+    Register {
+        idx: usize,
+        bytes: Scalar<'trace>,
+    },
 }
 
 /// Memory event mode
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryMode {
     Read,
     Write,
     ReadWrite,
 }
 
-/// In-memory list of events for testing/fuzzing purposes
+/// In-memory list of events for testing/fuzzing purposes (cheaply copiable)
+#[derive(Clone, Copy)]
 pub struct StaticEventList<'a> {
-    pub events: Vec<RawEvent<'a>>,
+    pub header: &'a TraceHeader,
+    pub events: &'a [RawEvent<'a>],
 }
 
-impl TraceParser for StaticEventList<'_> {
-    fn parse<EmitFn>(&mut self, progress: &mut dyn ProgressReporter, mut emit: EmitFn)
+impl<'a> ParserGenerator for StaticEventList<'a> {
+    type Parser = Self;
+
+    fn generate(&mut self) -> Result<Self::Parser, Infallible> {
+        Ok(*self)
+    }
+}
+
+impl<'a> Parser for StaticEventList<'a> {
+    type Err = Infallible;
+
+    fn header(&self) -> &TraceHeader {
+        self.header
+    }
+
+    fn parse<'trace, EmitFn>(
+        &'trace self,
+        progress: &mut dyn ProgressReporter,
+        mut emit: EmitFn,
+    ) -> Result<(), Self::Err>
     where
-        EmitFn: FnMut(RawEvent),
+        EmitFn: FnMut(RawEvent<'trace>),
     {
         progress.total(self.events.len());
         for (idx, event) in self.events.iter().enumerate() {
+            if progress.is_cancelled() {
+                return Ok(());
+            }
             emit(*event);
             progress.current(idx);
         }
+        Ok(())
     }
 }

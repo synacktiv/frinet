@@ -1,0 +1,16 @@
+[package]
+name = "frinet-python"
+version = "2.1.0"
+edition = "2024"
+rust-version.workspace = true
+
+[lib]
+name = "native"
+crate-type = ["cdylib"]
+
+[dependencies]
+frinet-db = { workspace = true }
+frinet-index = { workspace = true }
+
+memmap2 = { workspace = true }
+pyo3 = { workspace = true, features = ["abi3-py311"] }

@@ -1,107 +1,78 @@
 use std::collections::BTreeMap;
 
 use frinet_db::{
-    flat::{Addr, MemNode, Time},
+    format::{Addr, MemNode, Time},
     irange::IRange,
 };
-use smallvec::SmallVec;
 
-/// Disjoint leaves
-pub struct DisjointPass<D> {
+/// Pass over memory write leaves, producing a stream of [DisjointMemLeaf]
+#[derive(Default)]
+pub struct DisjointPass<'trace> {
     current_time: Time,
     /// Temporary leaves by start address
-    temporaries: BTreeMap<Addr, TemporaryLeaf<D>>,
+    temporaries: BTreeMap<Addr, TemporaryLeaf<'trace>>,
 
     // keep vecs around to save some allocations
     to_remove: Vec<Addr>,
-    to_add: Vec<TemporaryLeaf<D>>,
+    to_add: Vec<TemporaryLeaf<'trace>>,
     fragments: Vec<MemNode>,
 }
 
-impl<D> Default for DisjointPass<D> {
-    fn default() -> Self {
-        Self {
-            current_time: 0,
-            temporaries: BTreeMap::default(),
-            to_remove: Vec::default(),
-            to_add: Vec::default(),
-            fragments: Vec::default(),
-        }
-    }
-}
-
-pub struct DisjointMemLeaf<D> {
+/// Output of [DisjointPass]
+pub struct DisjointMemLeaf<'trace> {
     pub node: MemNode,
-    pub data: D,
+    pub bytes: &'trace [u8],
 }
 
-pub trait DataCut: Copy {
-    fn cut(self, cut_left: usize, cut_right: usize) -> Self;
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct NoData;
-
-impl DataCut for NoData {
-    fn cut(self, _: usize, _: usize) -> Self {
-        self
-    }
-}
-
-struct TemporaryLeaf<D> {
+struct TemporaryLeaf<'trace> {
     time_min: Time,
     addr_min: Addr,
-    addr_max: Addr,
-    bytes: SmallVec<[u8; 8]>,
-    data: D,
+    bytes: &'trace [u8],
 }
 
-impl<D: DataCut> TemporaryLeaf<D> {
-    fn complete(&self, time_max: Time) -> DisjointMemLeaf<D> {
+impl<'trace> TemporaryLeaf<'trace> {
+    /// Inclusive addr_max
+    fn addr_max(&self) -> Addr {
+        self.addr_min + self.bytes.len() as Addr - 1
+    }
+
+    fn complete(&self, time_max: Time) -> DisjointMemLeaf<'trace> {
         DisjointMemLeaf {
             node: MemNode {
-                time_min: self.time_min,
-                time_max,
-                addr_min: self.addr_min,
-                addr_max: self.addr_max,
+                time: IRange::new(self.time_min, time_max),
+                addr: IRange::new(self.addr_min, self.addr_max()),
             },
-            data: self.data,
+            bytes: self.bytes,
         }
     }
 
     fn mask_with_bbox(&self, bbox: MemNode) -> Self {
-        debug_assert!(self.addr_min <= bbox.addr_min);
-        debug_assert!(bbox.addr_max <= self.addr_max);
+        debug_assert!(self.time_min <= bbox.time.min);
+        debug_assert!(self.addr_min <= bbox.addr.min);
+        debug_assert!(bbox.addr.max <= self.addr_max());
+        debug_assert!(bbox.addr.span_usize() <= self.bytes.len());
 
-        let cut_left = (bbox.addr_min - self.addr_min) as usize;
-        let cut_right = (self.addr_max - bbox.addr_max) as usize;
-
-        let data = self.data.cut(cut_left, cut_right);
-
-        let cut_bytes = &self.bytes[cut_left..(self.bytes.len() - cut_right)];
-        let cut_bytes = SmallVec::from_slice(cut_bytes);
+        let mask_offset = (bbox.addr.min - self.addr_min) as usize;
+        let mask_size = bbox.addr.span_usize();
 
         Self {
-            time_min: bbox.time_min,
-            addr_min: bbox.addr_min,
-            addr_max: bbox.addr_max,
-            data,
-            bytes: cut_bytes,
+            time_min: bbox.time.min,
+            addr_min: bbox.addr.min,
+            bytes: &self.bytes[mask_offset..][..mask_size],
         }
     }
 }
 
-impl<D: DataCut> DisjointPass<D> {
+impl<'trace> DisjointPass<'trace> {
     pub fn push_memory_write<EmitLeaf>(
         &mut self,
         time: Time,
         addr: Addr,
-        bytes: &[u8],
-        data: D,
+        bytes: &'trace [u8],
         can_dedup: bool,
         mut emit_leaf: EmitLeaf,
     ) where
-        EmitLeaf: FnMut(DisjointMemLeaf<D>),
+        EmitLeaf: FnMut(DisjointMemLeaf<'trace>),
     {
         // checked by the caller
         debug_assert!(!bytes.is_empty());
@@ -109,20 +80,16 @@ impl<D: DataCut> DisjointPass<D> {
 
         self.current_time = time;
 
-        if can_dedup {
-            if self.is_duplicate_write(addr, bytes) {
-                return;
-            }
+        if can_dedup && self.is_duplicate_write(addr, bytes) {
+            return;
         }
 
         let addr_range = IRange::from_start_len(addr, bytes.len() as _);
 
         let new = TemporaryLeaf {
             time_min: time,
-            addr_min: addr_range.min,
-            addr_max: addr_range.max,
-            bytes: SmallVec::from_slice(bytes),
-            data,
+            addr_min: addr,
+            bytes,
         };
 
         let new_rect = new.complete(Time::MAX).node;
@@ -147,21 +114,21 @@ impl<D: DataCut> DisjointPass<D> {
                 );
 
                 let existing_masked = existing.mask_with_bbox(fragment);
-                if fragment.time_max == Time::MAX {
+                if fragment.time.max == Time::MAX {
                     // add fragment to the working set
-                    if existing_rect.addr_min == existing_masked.addr_min {
+                    if existing_rect.addr.min == existing_masked.addr_min {
                         will_be_replaced = true;
                     }
                     self.to_add.push(existing_masked);
                 } else {
                     // emit the fragment as a leaf
-                    let leaf = existing_masked.complete(fragment.time_max);
+                    let leaf = existing_masked.complete(fragment.time.max);
                     emit_leaf(leaf);
                 }
             }
 
             if !will_be_replaced {
-                self.to_remove.push(existing_rect.addr_min);
+                self.to_remove.push(existing_rect.addr.min);
             }
         }
 
@@ -175,12 +142,15 @@ impl<D: DataCut> DisjointPass<D> {
         self.temporaries.insert(new.addr_min, new);
     }
 
-    pub fn finish<EmitLeaf>(self, mut emit_leaf: EmitLeaf)
+    /// Emits the leaves that are never overwritten, they last until `time_end` (end of the trace)
+    pub fn finish<EmitLeaf>(self, time_end: Time, mut emit_leaf: EmitLeaf)
     where
-        EmitLeaf: FnMut(DisjointMemLeaf<D>),
+        EmitLeaf: FnMut(DisjointMemLeaf<'trace>),
     {
+        debug_assert!(self.current_time <= time_end);
+
         for partial in self.temporaries.values() {
-            let leaf = partial.complete(self.current_time);
+            let leaf = partial.complete(time_end);
             emit_leaf(leaf);
         }
     }
@@ -191,18 +161,18 @@ impl<D: DataCut> DisjointPass<D> {
         let mut cursor = check_range.min;
         for tmp in Self::iter_temporaries_in_range(&self.temporaries, check_range) {
             if cursor < tmp.addr_min {
-                return false; // the byte at `curr` is unknown
+                return false; // the byte at `cursor` is unknown
             }
 
             debug_assert!(tmp.addr_min <= cursor);
-            debug_assert!(cursor <= tmp.addr_max);
+            debug_assert!(cursor <= tmp.addr_max());
 
             let iter_from = cursor;
-            let iter_to = tmp.addr_max.min(check_range.max);
+            let iter_to = tmp.addr_max().min(check_range.max);
 
             for check_addr in iter_from..=iter_to {
                 debug_assert!(tmp.addr_min <= check_addr);
-                debug_assert!(check_addr <= tmp.addr_max);
+                debug_assert!(check_addr <= tmp.addr_max());
 
                 let check_byte = check_bytes[(check_addr - check_range.min) as usize];
                 let tmp_byte = tmp.bytes[(check_addr - tmp.addr_min) as usize];
@@ -219,13 +189,13 @@ impl<D: DataCut> DisjointPass<D> {
             cursor = iter_to + 1;
         }
 
-        return false;
+        false
     }
 
-    fn iter_temporaries_in_range(
-        temporaries: &BTreeMap<Addr, TemporaryLeaf<D>>,
+    fn iter_temporaries_in_range<'a>(
+        temporaries: &'a BTreeMap<Addr, TemporaryLeaf<'trace>>,
         query_range: IRange<Addr>,
-    ) -> impl Iterator<Item = &TemporaryLeaf<D>> {
+    ) -> impl Iterator<Item = &'a TemporaryLeaf<'trace>> {
         // TODO : rewrite with the cursor api when it become stable
         // (https://github.com/rust-lang/rust/issues/107540)
 
@@ -237,10 +207,10 @@ impl<D: DataCut> DisjointPass<D> {
         // temporaries are indexes by their `addr_min`,
         // if `query_min` is in the middle of a temporary,
         // include it in the result
-        if let Some((_, tmp)) = temporaries.range(..query_min).next_back() {
-            if query_min <= tmp.addr_max {
-                iter_from = tmp.addr_min;
-            }
+        if let Some((_, tmp)) = temporaries.range(..query_min).next_back()
+            && query_min <= tmp.addr_max()
+        {
+            iter_from = tmp.addr_min;
         }
 
         temporaries

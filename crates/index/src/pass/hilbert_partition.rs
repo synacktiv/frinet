@@ -1,15 +1,13 @@
-use std::marker::PhantomData;
+use std::ops::Range;
 
-use frinet_db::flat::*;
+use frinet_db::format::*;
 use frinet_db::irange::IRange;
 use frinet_db::memory::{MemReadSpec, MemWriteSpec};
-use frinet_db::register::RegSpec;
 use frinet_db::rtree::Spec;
 
-use crate::disjoint::NoData;
 use crate::hilbert_spec::HilbertSpec;
-use crate::parser::{ProgressReporter, TraceParser};
-use crate::pass::{Event, RTreeScout, ScoutPass, parse_and_normalize_events};
+use crate::parser::{Parser, ProgressReporter};
+use crate::pass::{Event, ScoutPass, find_zone_containing_addr_range, parse_and_normalize_events};
 
 pub const BITS_PER_DIM: usize = 4;
 pub const PARTITIONS: usize = (1_usize << BITS_PER_DIM).pow(2);
@@ -17,85 +15,64 @@ pub const PARTITIONS: usize = (1_usize << BITS_PER_DIM).pow(2);
 pub struct HilbertPartitionPass {
     pub write_zones: Vec<RTreePartitions<MemWriteSpec>>,
     pub read_zones: Vec<RTreePartitions<MemReadSpec>>,
-    pub registers: Vec<RTreePartitions<RegSpec>>,
 }
 
-pub fn hilbert_partition_pass<Parser>(
-    parser: &mut Parser,
+pub fn hilbert_partition_pass<P>(
+    mut parser: P,
     progress: &mut dyn ProgressReporter,
     scout: &ScoutPass,
-) -> HilbertPartitionPass
+) -> Result<HilbertPartitionPass, P::Err>
 where
-    Parser: TraceParser + Send,
+    P: Parser,
 {
+    let plan = &scout.plan;
     let mut pass = HilbertPartitionPass {
-        write_zones: scout
-            .write_zones
-            .iter()
-            .map(|zone| RTreePartitions::new(zone.bbox))
-            .collect(),
-        read_zones: scout
-            .read_zones
-            .iter()
-            .map(|zone| RTreePartitions::new(zone.bbox))
-            .collect(),
-        registers: scout
-            .registers
-            .iter()
-            .map(|reg| RTreePartitions::new(reg.bbox))
-            .collect(),
+        write_zones: tree_partitions(&plan.write_zones),
+        read_zones: tree_partitions(&plan.read_zones),
     };
 
-    parse_and_normalize_events(
-        parser,
-        progress,
-        |name| scout.reg_name_mapping[name],
-        |_| NoData,
-        |item| match item {
-            Event::MemoryWrite(leaf) => {
-                let addr_range = leaf.node.addr_range();
-                let idx = find_zone_containing_addr_range(&scout.write_zones, addr_range);
-                pass.write_zones[idx].push_leaf(MemWriteLeaf {
-                    node: leaf.node,
-                    packed_data: 0, // we do not care about `packed_data` in this pass
-                });
-            }
-            Event::MemoryRead(leaf) => {
-                let addr_range = leaf.addr_range();
-                let idx = find_zone_containing_addr_range(&scout.read_zones, addr_range);
-                pass.read_zones[idx].push_leaf(leaf);
-            }
-            Event::Register { idx, leaf } => {
-                pass.registers[idx].push_leaf(leaf);
-            }
-            Event::AslrSlide(_) => {}
-        },
-    );
+    parse_and_normalize_events(&mut parser, progress, |item| match item {
+        Event::MemoryWrite(leaf) => {
+            let addr_range = leaf.node.addr;
+            let idx = find_zone_containing_addr_range(&pass.write_zones, addr_range);
+            pass.write_zones[idx].push_leaf(MemWriteLeaf {
+                node: leaf.node,
+                data: 0, // we do not care about `data` in this pass
+            });
+        }
+        Event::MemoryRead(leaf) => {
+            let idx = find_zone_containing_addr_range(&pass.read_zones, leaf.addr);
+            pass.read_zones[idx].push_leaf(leaf);
+        }
+        Event::Register { .. } => {}
+    })?;
 
-    pass
+    for partitions in &mut pass.write_zones {
+        partitions.compute_starts();
+    }
+    for partitions in &mut pass.read_zones {
+        partitions.compute_starts();
+    }
+
+    Ok(pass)
 }
 
-fn find_zone_containing_addr_range(
-    zones: &[RTreeScout<MemNode>],
-    addr_range: IRange<u64>,
-) -> usize {
-    zones
+fn tree_partitions<S: HilbertSpec>(plans: &[RTreePlan<S>]) -> Vec<RTreePartitions<S>> {
+    plans
         .iter()
-        .map(|scout| scout.bbox.addr_range())
-        .enumerate()
-        .find(|(_, zone_range)| !zone_range.is_disjoint(&addr_range))
-        .map(|(idx, _)| idx)
-        .expect("no zone found for memory leaf")
+        .map(|plan| RTreePartitions::new(plan.bbox))
+        .collect()
 }
 
 pub struct RTreePartitions<S: Spec> {
     pub partitions: Box<[Partition; PARTITIONS]>,
     pub bbox: S::Node,
-    _phantom: PhantomData<S>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Partition {
+    /// Index of the first leaf of this partition in the R-Tree leaves
+    pub start: usize,
     pub leaf_count: usize,
     pub time_range: IRange<Time>,
 }
@@ -104,8 +81,7 @@ impl<S: HilbertSpec> RTreePartitions<S> {
     pub fn new(bbox: S::Node) -> Self {
         Self {
             bbox,
-            partitions: Box::new([Partition::default(); _]),
-            _phantom: PhantomData,
+            partitions: Box::new([Partition::default(); PARTITIONS]),
         }
     }
 
@@ -120,11 +96,27 @@ impl<S: HilbertSpec> RTreePartitions<S> {
         partition.time_range.min = partition.time_range.min.min(time_range.min);
         partition.time_range.max = partition.time_range.max.max(time_range.max);
     }
+
+    fn compute_starts(&mut self) {
+        let mut start = 0;
+        for partition in self.partitions.iter_mut() {
+            partition.start = start;
+            start += partition.leaf_count;
+        }
+    }
+}
+
+impl Partition {
+    /// Range of leaves of this partition in the R-Tree leaves
+    pub fn range(&self) -> Range<usize> {
+        self.start..self.start + self.leaf_count
+    }
 }
 
 impl Default for Partition {
     fn default() -> Self {
         Self {
+            start: 0,
             leaf_count: 0,
             time_range: IRange {
                 min: Time::MAX,

@@ -1,0 +1,47 @@
+# Main test suite, on every PR and every push to main:
+# - required: ubuntu with stable and beta toolchains
+# - os-check: macOS and Windows with stable
+# Adapted from https://github.com/jonhoo/rust-ci-conf
+permissions:
+  contents: read
+on:
+  push:
+    branches: [main]
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+name: test
+jobs:
+  required:
+    runs-on: ubuntu-latest
+    name: ubuntu / ${{ matrix.toolchain }}
+    strategy:
+      matrix:
+        toolchain: [stable, beta]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+      - name: Install ${{ matrix.toolchain }}
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # branch=master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - name: cargo test --locked
+        run: cargo test --workspace --exclude frinet-fuzz --locked --all-features --all-targets
+      # https://github.com/rust-lang/cargo/issues/6669
+      - name: cargo test --doc
+        run: cargo test --workspace --locked --all-features --doc
+  os-check:
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.os }} / stable
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # branch=master
+        with:
+          toolchain: stable
+      - name: cargo test
+        run: cargo test --workspace --exclude frinet-fuzz --locked --all-features --all-targets

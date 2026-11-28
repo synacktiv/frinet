@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "frinet"
+version = "2.1.0"
+description = "Query Frinet trace databases"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Wardenfar" }]
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[project.urls]
+Repository = "https://github.com/synacktiv/frinet"
+
+[tool.maturin]
+manifest-path = "crates/python/Cargo.toml"
+python-source = "crates/python"
+module-name = "frinet.native"
+include = ["frinet/py.typed", "frinet/native.pyi"]

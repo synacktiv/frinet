@@ -1,76 +1,119 @@
 # Frinet
 
-> By combining Frida with an enhanced version of Tenet, Frinet facilitates the study of large programs, vulnerability research and root-cause analysis on iOS, Android, Linux, Windows, and most architectures. [Blogpost on the Synacktiv website](https://www.synacktiv.com/publications/frinet-reverse-engineering-made-easier)
+![Frinet](screenshots/overview.png)
 
-<p align="center">
-<img alt="Tenet" src="screenshots/frinet.png"/>
-</p>
+By combining Frida with an enhanced version of Tenet, Frinet eases the study of large programs,
+vulnerability research and root-cause analysis on Linux, Android, iOS and Windows: record an
+execution trace with Frida, then explore it in IDA (timeline, registers, memory and call tree),
+over traces of up to 2 billion instructions.
 
-This version is a complete rewrite of `synacktiv/frinet` (originally a fork of [gaasedelen/tenet](https://github.com/synacktiv/frinet/tree/legacy)).
-You can still find the old version on the [legacy branch](https://github.com/synacktiv/frinet/tree/legacy).
+This version is a complete rewrite of Frinet, originally a fork of
+[gaasedelen/tenet](https://github.com/gaasedelen/tenet): the old version stays on the
+[legacy branch](https://github.com/synacktiv/frinet/tree/legacy).
+[Blogpost](https://www.synacktiv.com/publications/frinet-reverse-engineering-made-easier) ·
+[SSTIC 2026 talk, in French](https://www.sstic.org/2026/presentation/spatial_frinet/) (video, slides, paper)
 
-This project was presented at SSTIC 2026 (in French) : [video/slides/paper](https://www.sstic.org/2026/presentation/spatial_frinet/).
+## Installation & usage
 
-The new archictecture is based on four components :
-- `Indexer` : A Rust CLI that produces an optimized index from a trace file.
-- `Backend` : A Rust crate that implements specialized algorihms to query the optimized index file.
-- `Backend (Python bindings)` : A Rust crate that exposes a python interface.
-- `IDA Plugin` : A thin layer of python code that queries and integrates data from the backend into the IDA interface.
+### Installation
+
+```bash
+hcli plugin install frinet
+```
+
+Or manually, in the Python interpreter IDA uses:
+
+```bash
+git clone https://github.com/synacktiv/frinet
+cd frinet
+pip install frinet
+cp -r frontend ~/.idapro/plugins/frinet
+```
+
+### Usage
+
+Trace a function with Frida (`pip install frida frida-tools`), here from `ls!0x4c00` until it
+returns:
+
+```bash
+python tracers/frida/tracer.py -t ls -s 'ls!0x4c00' -f /bin/ls
+```
+
+Then open the trace in IDA (_File > Load file > Open Frinet trace or DB..._): it is indexed on
+the way into `<trace>.db`, which IDA offers to reuse the next time.
+
+To index a large trace ahead of time, without IDA, install the CLI indexer (Rust 1.89 or newer):
+
+```bash
+cargo install --git https://github.com/synacktiv/frinet frinet-cli
+frinet index tracers/frida/traces/ls_<timestamp>_<tid>_0.trace ls.db
+```
+
+## Architecture
+
+Entry points:
+
+- **IDA plugin**: explore a trace right in IDA, next to the disassembly.
+- **Python** (`frinet` package): script around your traces, one or many, with your own queries.
+  The IDA plugin is built on it.
+- **CLI** (`frinet index`): index a large trace ahead of time, without IDA. The DB is
+  memory-mapped and read in place, so an indexed trace then opens instantly.
+
+![indexer](screenshots/indexer.png)
+
+Rust modules:
+
+- **Indexer** (`crates/index`)
+    - turns a trace ([format](docs/TRACE_FORMAT.md)) into a DB
+    - up to 2 billion instructions per trace
+- **DB engine** (`crates/db`)
+    - registers as time series, and every execution of an address from the PC
+    - memory reads and writes in packed R-trees
+    - multi-threaded memory search, with its own regex engine (`crates/regex`)
+    - zero copy: the queries read the memory-mapped DB in place
+
+Tests, fuzzing and benchmarks: [docs/TESTING.md](docs/TESTING.md).
 
 ## Features
 
-**Tracer based on Frida**: Identical to the legacy version of Frinet.
+**Timeline & trails**: past and future of each instruction
 
-**Indexer / Backend**:
-- Efficient indexing of traces with up to 2 billion instructions (~100 GB).
-- Independent of the trace format (only the Tenet format is supported for now).
-- Multi-threaded memory search with full regex support.
-- Usable as a standalone Rust library: `crates/db`.
+![timeline](screenshots/timeline.png)
 
-**Frontend**: 
-- Timeline / Register / Memory views.
-- Assembly timeline trails (red/green/blue).
-- Memory read/write breakpoint.
-- Jump to first/prev/next/last execution.
+**Registers**: values and changes at each step
 
-### Missing features & TODOs
+![registers](screenshots/registers.png)
 
-- Reach frontend feature parity with Frinet v1:
-  - The call tree view is not yet implemented.
-- UI polishing.
-  
-## Build & Installation
+**Memory**: read/write breakpoints, first/prev/next/last access
 
-```bash
-# Build the Python bindings shared lib
-apt install python3-dev
-cargo build --release
-cp target/release/libfrinet_db.so frontend/frinet_db.so
+![memory](screenshots/memory.png)
 
-# Symlink (or copy) the IDA Plugin
-ln -s $PWD/frontend ~/.idapro/plugins/frinet
-```
+**Search**: multi-threaded memory search with regex
 
-## Usage
+![search](screenshots/search.png)
 
-```bash
-# 1. Trace /bin/ls with frida
-python tracer/trace.py spawn /bin/ls ls 0x4c00
+**Call tree**: step over / step out
 
-# 2. Build an optimised index of the trace
-cargo run --bin frinet --release -- index --format tenet tracer/traces/ls_xxxx.tenet ls.db
+![calltree](screenshots/calltree.png)
 
-# 3. Open the trace in IDA (File > Load File > Open Frinet DB...)
-```
+**Console**: `frinet_cursor`, the cursor the views follow
 
-## Testing & Fuzzing & Benchmark
+![console](screenshots/console.png)
 
-```bash
-cargo test
+The `frinet` package also reads a DB outside IDA:
 
-cargo install cargo-fuzz
-cargo +nightly fuzz run --fuzz-dir crates/fuzz register_indexing
+```python
+import frinet
 
-cargo install cargo-criterion
-BENCH_DB=my.db cargo criterion
+trace = frinet.open("ls.db")
+ls = trace.module("ls")
+
+# every execution of an instruction of ls, with the byte it loads
+for time in trace.pc.times_with(ls.start + 0x157dc):
+    state = trace.at(time)
+    print(time, state.mem.read(state.regs.x28, 1))
+
+# where and when "README.md" is in memory
+for match in trace.search("README.md").result():
+    print(hex(match.addr), match.first_time, match.last_time)
 ```
