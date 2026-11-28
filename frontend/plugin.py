@@ -6,6 +6,7 @@ from PySide6 import QtWidgets
 import os
 
 import ida_idaapi
+import ida_idp
 import ida_kernwin
 import ida_nalt
 import idautils
@@ -16,6 +17,9 @@ from timeline_widget import TimelineDock
 from memory_widget import MemoryWidget
 from search_results_widget import SearchResultsWidget
 from calltree_widget import CallTreeWidget
+from calls_model import CallModel
+from graph_widget import GraphWidget
+from story_widget import StoryWidget
 
 
 class IdaDecompiler(IDecompiler):
@@ -28,6 +32,7 @@ class IdaDecompiler(IDecompiler):
         self.memory_windows = []
         self.search_results_windows = []
         self.calltree_windows = []
+        self.call_models = {}  # path -> CallModel shared by tree / graph / story
 
     def navigate_to_addr(self, addr):
         widget = ida_kernwin.find_widget("IDA View-A")
@@ -52,17 +57,58 @@ class IdaDecompiler(IDecompiler):
         window.show()
         self.search_results_windows.append(window)
 
-    def open_calltree_window(self, path):
-        try:
-            widget = CallTreeWidget(self.ctx, self.navigate_to_addr, path)
-        except Exception as e:
-            print(f"[frinet] cannot open call list {path}: {e}")
-            return
-        title = "Call tree - " + os.path.basename(path)
+    def call_model(self, path):
+        """Load a .calls.txt once; every view of it shares the same model."""
+        model = self.call_models.get(path)
+        if model is None:
+            try:
+                model = CallModel(path, self.ctx)
+            except Exception as e:
+                print(f"[frinet] cannot open call list {path}: {e}")
+                return None
+            self.call_models[path] = model
+        return model
+
+    def names_changed(self):
+        for model in self.call_models.values():
+            model.names_changed()
+
+    def _show_call_view(self, title, widget, dock_target, dock_pos):
         window = DockableWindow(title, widget)
         window.show()
-        window.set_dock_position("IDA View-A", ida_kernwin.DP_RIGHT)
+        window.set_dock_position(dock_target, dock_pos)
         self.calltree_windows.append(window)
+
+    def open_calltree_window(self, path):
+        model = self.call_model(path) if isinstance(path, str) else path
+        if model is None:
+            return
+        widget = CallTreeWidget(
+            self.ctx, self.navigate_to_addr, model,
+            open_graph=self.open_graph_window, open_story=self.open_story_window,
+        )
+        self._show_call_view(
+            "Call tree - " + os.path.basename(model.path), widget, "IDA View-A", ida_kernwin.DP_RIGHT
+        )
+
+    def open_graph_window(self, model):
+        model = self.call_model(model) if isinstance(model, str) else model
+        if model is None:
+            return
+        widget = GraphWidget(self.ctx, self.navigate_to_addr, model)
+        self._show_call_view(
+            "Call graph - " + os.path.basename(model.path), widget,
+            "Output window", ida_kernwin.DP_TAB | ida_kernwin.DP_BEFORE,
+        )
+
+    def open_story_window(self, model):
+        model = self.call_model(model) if isinstance(model, str) else model
+        if model is None:
+            return
+        widget = StoryWidget(self.ctx, self.navigate_to_addr, model)
+        self._show_call_view(
+            "Story - " + os.path.basename(model.path), widget, "IDA View-A", ida_kernwin.DP_TAB
+        )
 
     def open_timeline_window(self):
         window = TimelineDock(self.ctx)
@@ -276,6 +322,20 @@ class FrinetIDAPlugin(ida_idaapi.plugin_t):
             tooltip="Open a .calls.txt call list as a navigable tree",
             menu_path="File/Load file/",
         )
+        self.open_graph = Action(
+            action_id="frinet:open_graph",
+            label="Open Frinet call ~g~raph...",
+            callback=lambda: self.pick_calls_then(self.decompiler.open_graph_window),
+            tooltip="Open a .calls.txt as a flame chart / call graph synchronized with the timeline",
+            menu_path="File/Load file/",
+        )
+        self.open_story = Action(
+            action_id="frinet:open_story",
+            label="Open Frinet ~s~tory...",
+            callback=lambda: self.pick_calls_then(self.decompiler.open_story_window),
+            tooltip="Open the narrative of a trace (from its .calls.txt), with links to points in time",
+            menu_path="File/Load file/",
+        )
         self.prev_exec = Action(
             action_id="frinet:prev_execution",
             label="Go to prev execution",
@@ -304,6 +364,8 @@ class FrinetIDAPlugin(ida_idaapi.plugin_t):
         self.all_actions = [
             self.open_db,
             self.open_calltree,
+            self.open_graph,
+            self.open_story,
             self.prev_exec,
             self.next_exec,
             self.first_exec,
@@ -315,6 +377,8 @@ class FrinetIDAPlugin(ida_idaapi.plugin_t):
 
         self.ui_hooks = UIHooks(self)
         self.ui_hooks.hook()
+        self.idb_hooks = RenameHooks(self.decompiler)
+        self.idb_hooks.hook()
 
         return ida_idaapi.PLUGIN_KEEP
 
@@ -357,14 +421,20 @@ class FrinetIDAPlugin(ida_idaapi.plugin_t):
         self.ctx.open_db(path)
 
     def pick_and_open_calltree(self) -> None:
+        self.pick_calls_then(self.decompiler.open_calltree_window)
+
+    def pick_calls_then(self, open_fn) -> None:
         path = self.file_picker.pick_file(
             "Open Frinet call list", "Call lists (*.calls.txt *.txt);;All Files (*.*)"
         )
-        if not path:
-            return
-        self.decompiler.open_calltree_window(path)
+        if path:
+            open_fn(path)
 
     def term(self) -> None:
+        try:
+            self.idb_hooks.unhook()
+        except Exception:
+            pass
         print("frinet::term()")
 
     def render_lines(self, lines_out, widget, lines_in):
@@ -418,6 +488,27 @@ class FrinetIDAPlugin(ida_idaapi.plugin_t):
                         line, ida_kernwin.LROEF_FULL_LINE, color
                     )
                     lines_out.entries.push_back(entry)
+
+
+class RenameHooks(ida_idp.IDB_Hooks):
+    """Refresh call-list views (real names) when something is renamed in IDA."""
+
+    def __init__(self, decompiler):
+        super().__init__()
+        self.decompiler = decompiler
+        self._pending = False
+
+    def renamed(self, ea, new_name, local_name, old_name=None):
+        if not self._pending and self.decompiler.call_models:
+            self._pending = True
+            from PySide6.QtCore import QTimer
+
+            QTimer.singleShot(300, self._flush)  # several renames -> one refresh
+        return 0
+
+    def _flush(self):
+        self._pending = False
+        self.decompiler.names_changed()
 
 
 class UIHooks(ida_kernwin.UI_Hooks):
