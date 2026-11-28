@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QApplication,
 )
 from PySide6 import QtGui, QtWidgets
-from PySide6.QtCore import Qt, QPoint, QEvent
+from PySide6.QtCore import Qt, QPoint, QEvent, QSize
 
 from core import Ctx
 
@@ -46,7 +46,13 @@ class RegistersWidget(QtWidgets.QWidget):
         self.value_labels = []
 
         self.setup_ui()
+        # compact: take only the width the register list needs
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Preferred)
         self.on_time_update()
+
+    def sizeHint(self) -> QSize:
+        hint = super().sizeHint()
+        return QSize(self._grid.sizeHint().width() + 12, max(hint.height(), 300))
 
     def close(self) -> bool:
         is_closed = super().close()
@@ -78,7 +84,9 @@ class RegistersWidget(QtWidgets.QWidget):
         grid_widget = QWidget()
         layout = QGridLayout(grid_widget)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setHorizontalSpacing(2)
+        layout.setVerticalSpacing(1)
+        self._grid = grid_widget
 
         font_name = QFont("monospace")
         font_name.setStyleHint(QtGui.QFont.StyleHint.Monospace)
@@ -88,11 +96,11 @@ class RegistersWidget(QtWidgets.QWidget):
         font_value.setStyleHint(QtGui.QFont.StyleHint.Monospace)
 
         metrics = QFontMetrics(font_value)
-        max_val_width = metrics.horizontalAdvance("0x0000000000000000")
+        max_val_width = metrics.horizontalAdvance("0x0000000000000000") + 4
 
         for idx, reg_name in enumerate(self.names):
             btn_prev = QPushButton("<")
-            btn_prev.setFixedSize(16, 16)
+            btn_prev.setFixedSize(12, 16)
             btn_prev.setStyleSheet("border: none; margin: 0px; padding: 0px;")
             btn_prev.setCursor(Qt.CursorShape.PointingHandCursor)
             btn_prev.clicked.connect(functools.partial(self.nav_prev, reg_name))
@@ -120,7 +128,7 @@ class RegistersWidget(QtWidgets.QWidget):
             self.value_labels.append(label_value)
 
             btn_next = QPushButton(">")
-            btn_next.setFixedSize(16, 16)
+            btn_next.setFixedSize(12, 16)
             btn_next.setStyleSheet("border: none; margin: 0px; padding: 0px;")
             btn_next.setCursor(Qt.CursorShape.PointingHandCursor)
             btn_next.clicked.connect(functools.partial(self.nav_next, reg_name))

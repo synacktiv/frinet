@@ -118,8 +118,9 @@ class IdaDecompiler(IDecompiler):
         self.timeline_windows.append(window)
 
     def open_registers_window(self):
-        window = DockableWindow("Registers", RegistersWidget(self.ctx))
-        window.set_dock_position(None, ida_kernwin.DP_RIGHT)
+        window = DockableWindow("Registers", RegistersWidget(self.ctx), use_size_hint=True)
+        # DP_SZHINT: dock it at the width the register list asks for, not half the screen
+        window.set_dock_position(None, ida_kernwin.DP_RIGHT | getattr(ida_kernwin, "DP_SZHINT", 0))
         window.show()
         self.registers_windows.append(window)
 
@@ -178,8 +179,9 @@ class DockableWindow(ida_kernwin.PluginForm):
     dock_position: Optional[Any]
     dock_target: Optional[Any]
 
-    def __init__(self, title, widget):
+    def __init__(self, title, widget, use_size_hint=False):
         super(DockableWindow, self).__init__()
+        self.use_size_hint = use_size_hint
         self.visible = False
         self.title = title
         self.widget = widget
@@ -199,7 +201,10 @@ class DockableWindow(ida_kernwin.PluginForm):
         self.visible = False
 
     def show(self):
-        self.Show(self.title, options=ida_kernwin.WOPN_NOT_CLOSED_BY_ESC)
+        options = ida_kernwin.WOPN_NOT_CLOSED_BY_ESC
+        if self.use_size_hint:
+            options |= getattr(ida_kernwin.PluginForm, "WOPN_DP_SZHINT", 0) or getattr(ida_kernwin, "WOPN_DP_SZHINT", 0)
+        self.Show(self.title, options=options)
         self.visible = True
         self.apply_dock_position()
 

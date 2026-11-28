@@ -114,6 +114,7 @@ class StoryWidget(QWidget):
 
     def _show_html(self, text: str) -> None:
         self.view.setHtml(text)
+        self._compact_headings()
         self._index_links()
         self.on_time_update()
 
@@ -130,6 +131,7 @@ class StoryWidget(QWidget):
             self.view.setHtml(text)
         else:
             self.view.setMarkdown(text)
+        self._compact_headings()
         self._index_links()
         self.status.setText(os.path.basename(path))
         self.on_time_update()
@@ -149,6 +151,31 @@ class StoryWidget(QWidget):
         with open(path, "w", encoding="utf-8", newline="\n") as fd:
             fd.write(text)
         self.status.setText(f"Saved {os.path.basename(path)}")
+
+    def _compact_headings(self) -> None:
+        """Headings only slightly larger than the text (Qt's defaults are huge).
+
+        Qt sizes <h1>..<h3> with a relative size step (xx-large / x-large / large),
+        not a point size, so the step is lowered: h1 -> large, h2/h3 -> normal, bold.
+        """
+        steps = {1: 1, 2: 0, 3: 0}
+        doc = self.view.document()
+        block = doc.begin()
+        while block.isValid():
+            level = block.blockFormat().headingLevel()
+            if level:
+                cur = QTextCursor(block)
+                cur.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+                cur.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+                cf = QTextCharFormat()
+                cf.setProperty(QTextFormat.Property.FontSizeAdjustment, steps.get(level, 0))
+                cf.setFontWeight(700)
+                cur.mergeCharFormat(cf)
+                bf = block.blockFormat()
+                bf.setTopMargin(2 if level == 1 else 8)
+                bf.setBottomMargin(3)
+                cur.setBlockFormat(bf)
+            block = block.next()
 
     def _index_links(self) -> None:
         """Find every time link in the document: (line, start of its paragraph)."""
