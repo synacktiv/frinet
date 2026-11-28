@@ -23,7 +23,7 @@ from story_widget import StoryWidget
 
 
 FRINET_MENU_ID = "frinet:menu"
-FRINET_MENU = "Frinet/"
+FRINET_MENU = "Edit/Plugins/Frinet/"
 HELP_URL = "https://github.com/sigmantu1-design/frinet#readme"
 
 
@@ -349,9 +349,9 @@ class FrinetIDAPlugin(ida_idaapi.plugin_t):
         self.decompiler = IdaDecompiler()
         self.ctx = self.decompiler.ctx
 
-        # The Frinet menu, in the menu bar before Help
+        # The Frinet submenu, at the end of Edit > Plugins
         try:
-            ida_kernwin.create_menu(FRINET_MENU_ID, "Frinet", "Help")
+            ida_kernwin.create_menu(FRINET_MENU_ID, "Frinet", "Edit/Plugins/")
         except Exception as e:  # never block the plugin over the menu
             print(f"[frinet] cannot create the Frinet menu: {e}")
         M = FRINET_MENU
@@ -359,14 +359,14 @@ class FrinetIDAPlugin(ida_idaapi.plugin_t):
 
         self.open_db = Action(
             action_id="frinet:open_db",
-            label="Open ~F~rinet DB...",
+            label="Open Frinet DB...",
             callback=self.pick_and_open_db_file,
             tooltip="Open a Frinet DB (indexed trace)",
             menu_path=[M, "File/Load file/"],
         )
         self.close_db = Action(
             action_id="frinet:close_db",
-            label="Close trace",
+            label="Close Frinet DB",
             callback=self.ctx.close_db,
             tooltip="Close the Frinet DB and its windows",
             menu_path=M,
@@ -374,28 +374,28 @@ class FrinetIDAPlugin(ida_idaapi.plugin_t):
         )
         self.open_calltree = Action(
             action_id="frinet:open_calltree",
-            label="Open Frinet ~c~all tree...",
+            label="Open Frinet call tree...",
             callback=self.pick_and_open_calltree,
             tooltip="Open a .calls.txt call list as a navigable tree",
             menu_path=[M, "File/Load file/"],
         )
         self.open_graph = Action(
             action_id="frinet:open_graph",
-            label="Open Frinet call ~g~raph...",
+            label="Open Frinet call graph...",
             callback=lambda: self.pick_calls_then(self.decompiler.open_graph_window),
             tooltip="Open a .calls.txt as a flame chart / call graph synchronized with the timeline",
             menu_path=M,
         )
         self.open_story = Action(
             action_id="frinet:open_story",
-            label="Open Frinet ~s~tory...",
+            label="Open Frinet story...",
             callback=lambda: self.pick_calls_then(self.decompiler.open_story_window),
             tooltip="Open the narrative of a trace (from its .calls.txt), with links to points in time",
             menu_path=M,
         )
         self.show_timeline = Action(
             action_id="frinet:show_timeline",
-            label="Show Timeline",
+            label="Show Frinet timeline",
             callback=self.decompiler.show_timeline,
             tooltip="Open the Timeline again (if you closed it)",
             menu_path=M,
@@ -403,7 +403,7 @@ class FrinetIDAPlugin(ida_idaapi.plugin_t):
         )
         self.show_registers = Action(
             action_id="frinet:show_registers",
-            label="Show Registers",
+            label="Show Frinet registers",
             callback=self.decompiler.show_registers,
             tooltip="Open the Registers window again (if you closed it)",
             menu_path=M,
@@ -411,7 +411,7 @@ class FrinetIDAPlugin(ida_idaapi.plugin_t):
         )
         self.show_memory = Action(
             action_id="frinet:show_memory",
-            label="Show Memory",
+            label="Show Frinet memory",
             callback=self.decompiler.show_memory,
             tooltip="Open the Memory window again (if you closed it)",
             menu_path=M,
@@ -419,7 +419,7 @@ class FrinetIDAPlugin(ida_idaapi.plugin_t):
         )
         self.search_memory = Action(
             action_id="frinet:search_memory",
-            label="Search memory...",
+            label="Search Frinet memory...",
             callback=self.prompt_search_memory,
             tooltip="Search the memory of the whole trace for text or a regular expression",
             menu_path=M,
@@ -459,7 +459,7 @@ class FrinetIDAPlugin(ida_idaapi.plugin_t):
         )
         self.help = Action(
             action_id="frinet:help",
-            label="Help (guide)...",
+            label="Frinet guide...",
             callback=lambda: ida_kernwin.open_url(HELP_URL),
             tooltip="Open the Frinet for Windows guide in the browser",
             menu_path=M,
